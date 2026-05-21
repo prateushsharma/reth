@@ -71,6 +71,7 @@ pub use externevm::ExternEvmFactory;
 pub use build::EthBlockAssembler;
 
 pub mod protocol_store;
+pub mod extern_proto;
 
 mod receipt;
 pub use receipt::RethReceiptBuilder;

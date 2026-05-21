@@ -1,78 +1,120 @@
-#![allow(missing_docs)]
+let handle = builder
+    .with_types::<EthereumNode>()
+    .with_components(
+        EthereumNode::components()
+            .executor(ExternEvmExecutorBuilder),
+    )
+    .with_add_ons(EthereumAddOns::default())
+    .on_component_initialized(move |ctx| {
+        ctx.components().network().add_rlpx_sub_protocol(
+            ExternEvmProtoHandler::new(validator_addr)
+        );
+        eprintln!("[ExternEVM] Registered extern/1 subprotocol");
+        Ok(())
+    })
+    .launch()
+    .await?;//! ExternEVM — Modified Reth node with API_CALL precompile + extern/1 p2p subprotocol
 
-#[global_allocator]
-static ALLOC: reth_cli_util::allocator::Allocator = reth_cli_util::allocator::new_allocator();
-
-#[cfg(all(feature = "jemalloc", unix))]
-use reth_cli_util::allocator::tikv_jemalloc_sys as _;
-
-#[cfg(all(feature = "jemalloc-prof", unix))]
-#[unsafe(export_name = "malloc_conf")]
-static MALLOC_CONF: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:19\0";
-
-use alloy_evm::eth::spec::EthExecutorSpec;
-use clap::Parser;
 use reth::cli::Cli;
-use reth_chainspec::{EthereumHardforks, Hardforks};
-use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
-use reth_ethereum_primitives::EthPrimitives;
-use reth_evm_ethereum::{EthEvmConfig, ExternEvmFactory};
+use reth_ethereum_evm::externevm::ExternEvmFactory;
+use reth_ethereum_evm::extern_proto::ExternEvmProtoHandler;
 use reth_node_builder::{
-    components::ExecutorBuilder, BuilderContext, FullNodeTypes, NodeTypes,
+    components::ExecutorBuilder, BuilderContext, FullNodeTypes,
 };
-use reth_node_ethereum::EthereumNode;
-use tracing::info;
+use reth_node_ethereum::{node::EthereumAddOns, EthereumNode};
 
-/// Executor builder that uses ExternEvmFactory to inject the API_CALL precompile.
-#[derive(Debug, Default, Clone, Copy)]
-#[non_exhaustive]
+use alloy_evm::EthEvmConfig;
+use alloy_primitives::Address;
+
+// ---------------------------------------------------------------------------
+// Executor builder — injects our ExternEvmFactory into the EVM pipeline
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Default, Clone)]
 struct ExternEvmExecutorBuilder;
 
-impl<Types, Node> ExecutorBuilder<Node> for ExternEvmExecutorBuilder
-where
-    Types: NodeTypes<
-        ChainSpec: Hardforks + EthExecutorSpec + EthereumHardforks,
-        Primitives = EthPrimitives,
-    >,
-    Node: FullNodeTypes<Types = Types>,
-{
-    type EVM = EthEvmConfig<Types::ChainSpec, ExternEvmFactory>;
+impl<Node: FullNodeTypes> ExecutorBuilder<Node> for ExternEvmExecutorBuilder {
+    type EVM = EthEvmConfig<ExternEvmFactory>;
 
     async fn build_evm(
         self,
         ctx: &BuilderContext<Node>,
     ) -> eyre::Result<Self::EVM> {
+        let chain_spec = ctx.chain_spec();
         Ok(EthEvmConfig::new_with_evm_factory(
-            ctx.chain_spec(),
+            chain_spec,
             ExternEvmFactory::new(),
         ))
     }
 }
 
+// ---------------------------------------------------------------------------
+// Validator address from env
+// ---------------------------------------------------------------------------
+
+/// Read the validator address from EXTERNEVM_VALIDATOR_ADDRESS env var.
+/// Falls back to the first Hardhat/Anvil dev account.
+fn get_validator_address() -> Address {
+    if let Ok(hex_str) = std::env::var("EXTERNEVM_VALIDATOR_ADDRESS") {
+        let hex_str = hex_str.trim().strip_prefix("0x").unwrap_or(hex_str.trim());
+        if hex_str.len() == 40 {
+            let mut addr = [0u8; 20];
+            let mut valid = true;
+            for i in 0..20 {
+                match u8::from_str_radix(&hex_str[i * 2..i * 2 + 2], 16) {
+                    Ok(b) => addr[i] = b,
+                    Err(_) => { valid = false; break; }
+                }
+            }
+            if valid {
+                return Address::new(addr);
+            }
+        }
+        eprintln!("[ExternEVM] Invalid EXTERNEVM_VALIDATOR_ADDRESS env var, using default");
+    }
+    // Default: 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266
+    let mut addr = [0u8; 20];
+    addr[0] = 0xf3; addr[1] = 0x9F; addr[2] = 0xd6; addr[3] = 0xe5;
+    addr[4] = 0x1a; addr[5] = 0xad; addr[6] = 0x88; addr[7] = 0xF6;
+    addr[8] = 0xF4; addr[9] = 0xce; addr[10] = 0x6a; addr[11] = 0xB8;
+    addr[12] = 0x82; addr[13] = 0x72; addr[14] = 0x79; addr[15] = 0xcf;
+    addr[16] = 0xfF; addr[17] = 0xb9; addr[18] = 0x22; addr[19] = 0x66;
+    Address::new(addr)
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+
 fn main() {
-    reth_cli_util::sigsegv_handler::install();
+    // Determine validator address early so we can log it
+    let validator_addr = get_validator_address();
+    eprintln!("[ExternEVM] Node validator address: {:?}", validator_addr);
 
-    if std::env::var_os("RUST_BACKTRACE").is_none() {
-        unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
-    }
+    Cli::parse_args()
+        .run(|builder, _| async move {
+            let handle = builder
+                .with_types::<EthereumNode>()
+                .with_components(
+                    EthereumNode::components()
+                        .executor(ExternEvmExecutorBuilder),
+                )
+                .with_add_ons(EthereumAddOns::default())
+                .launch()
+                .await?;
 
-    if let Err(err) = Cli::<EthereumChainSpecParser>::parse().run(async move |builder, _| {
-        info!(target: "reth::cli", "Launching ExternEVM node");
-        info!(target: "reth::cli", "API_CALL precompile at 0x00000000000000000000000000000000000000AA");
+            // Register the extern/1 subprotocol AFTER launch via NetworkHandle.
+            // This is the most compatible approach across Reth versions —
+            // NetworkHandle::add_rlpx_sub_protocol() is available on all recent builds.
+            let network = handle.node.network.clone();
+            network.add_rlpx_sub_protocol(
+                ExternEvmProtoHandler::new(validator_addr)
+            );
+            eprintln!(
+                "[ExternEVM] Registered extern/1 subprotocol for p2p value broadcasting"
+            );
 
-        let handle = builder
-            .with_types::<reth_node_ethereum::EthereumNode>()
-            .with_components(
-                EthereumNode::components()
-                    .executor(ExternEvmExecutorBuilder),
-            )
-            .with_add_ons(reth_node_ethereum::EthereumAddOns::default())
-            .launch_with_debug_capabilities()
-            .await?;
-
-        handle.wait_for_node_exit().await
-    }) {
-        eprintln!("Error: {err:?}");
-        std::process::exit(1);
-    }
+            handle.wait_for_node_exit().await
+        })
+        .unwrap();
 }

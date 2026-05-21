@@ -1,4 +1,4 @@
-//! ExternEVM custom EvmFactory — v2
+//! ExternEVM custom EvmFactory — v2 + p2p broadcasting
 //!
 //! Wraps the standard `EthEvmFactory` and injects the API_CALL precompile
 //! at address 0x00000000000000000000000000000000000000AA.
@@ -6,6 +6,7 @@
 //! v1: Single node fetches API, returns result directly.
 //! v2: Node fetches API, stores value in protocol store, computes
 //!     median/majority across all submissions, returns aggregated result.
+//!     Broadcasts fetched values to peers via extern/1 subprotocol.
 //!     In single-node mode, behavior is identical to v1.
 
 use alloy_evm::{
@@ -28,9 +29,10 @@ use serde_json::Value as JsonValue;
 use std::time::Duration;
 
 use crate::protocol_store::{
-    global_store, compute_median_uint256, compute_majority_string,
+    self, global_store, compute_median_uint256, compute_majority_string,
     compute_majority_bool,
 };
+use crate::extern_proto::{broadcast_sender, compute_request_hash, ExternDataMsg};
 
 /// The address of the API_CALL precompile: 0x00000000000000000000000000000000000000AA
 pub const API_CALL_ADDRESS: Address = {
@@ -43,24 +45,13 @@ pub const API_CALL_ADDRESS: Address = {
 const API_CALL_GAS: u64 = 3_000;
 
 /// Maximum request body size in bytes.
-const MAX_BODY_SIZE: usize = 16384;
+const MAX_BODY_SIZE: usize = 4096;
 
 /// Maximum response body size in bytes.
-const MAX_RESPONSE_SIZE: usize = 131072;
+const MAX_RESPONSE_SIZE: usize = 32_768;
 
 /// HTTP timeout in milliseconds.
 const HTTP_TIMEOUT_MS: u64 = 5000;
-
-/// This node's validator identity address (dev mode: first pre-funded account).
-const NODE_VALIDATOR_ADDRESS: Address = {
-    let mut addr = [0u8; 20];
-    addr[0] = 0xf3; addr[1] = 0x9F; addr[2] = 0xd6; addr[3] = 0xe5;
-    addr[4] = 0x1a; addr[5] = 0xad; addr[6] = 0x88; addr[7] = 0xF6;
-    addr[8] = 0xF4; addr[9] = 0xce; addr[10] = 0x6a; addr[11] = 0xB8;
-    addr[12] = 0x82; addr[13] = 0x72; addr[14] = 0x79; addr[15] = 0xcf;
-    addr[16] = 0xfF; addr[17] = 0xb9; addr[18] = 0x22; addr[19] = 0x66;
-    Address::new(addr)
-};
 
 // ---------------------------------------------------------------------------
 // ABI struct definition — matches the Solidity struct exactly.
@@ -78,18 +69,62 @@ sol! {
 }
 
 // ---------------------------------------------------------------------------
+// Configurable validator address
+// ---------------------------------------------------------------------------
+
+/// Get this node's validator address.
+/// Reads from EXTERNEVM_VALIDATOR_ADDRESS env var, falls back to dev account 1.
+fn node_validator_address() -> Address {
+    use std::sync::LazyLock;
+    static ADDR: LazyLock<Address> = LazyLock::new(|| {
+        if let Ok(hex_str) = std::env::var("EXTERNEVM_VALIDATOR_ADDRESS") {
+            let hex_str = hex_str.trim().strip_prefix("0x").unwrap_or(hex_str.trim());
+            if hex_str.len() == 40 {
+                let mut addr = [0u8; 20];
+                let mut valid = true;
+                for i in 0..20 {
+                    match u8::from_str_radix(&hex_str[i * 2..i * 2 + 2], 16) {
+                        Ok(b) => addr[i] = b,
+                        Err(_) => { valid = false; break; }
+                    }
+                }
+                if valid {
+                    let a = Address::new(addr);
+                    eprintln!("[ExternEVM] Validator address from env: {:?}", a);
+                    return a;
+                }
+            }
+            eprintln!("[ExternEVM] Invalid EXTERNEVM_VALIDATOR_ADDRESS, using default");
+        }
+        // Default: first Hardhat/Anvil dev account
+        // 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266
+        let mut addr = [0u8; 20];
+        addr[0] = 0xf3; addr[1] = 0x9F; addr[2] = 0xd6; addr[3] = 0xe5;
+        addr[4] = 0x1a; addr[5] = 0xad; addr[6] = 0x88; addr[7] = 0xF6;
+        addr[8] = 0xF4; addr[9] = 0xce; addr[10] = 0x6a; addr[11] = 0xB8;
+        addr[12] = 0x82; addr[13] = 0x72; addr[14] = 0x79; addr[15] = 0xcf;
+        addr[16] = 0xfF; addr[17] = 0xb9; addr[18] = 0x22; addr[19] = 0x66;
+        Address::new(addr)
+    });
+    *ADDR
+}
+
+// ---------------------------------------------------------------------------
 // One-time initialization
 // ---------------------------------------------------------------------------
 
+/// Ensures this node is registered as a validator in the protocol store.
+/// Called once on first precompile invocation.
 fn ensure_validator_registered() {
     use std::sync::Once;
     static INIT: Once = Once::new();
     INIT.call_once(|| {
+        let addr = node_validator_address();
         let store = global_store();
-        store.register_validator(NODE_VALIDATOR_ADDRESS);
+        store.register_validator(addr);
         eprintln!(
             "[ExternEVM v2] Registered self as validator: {:?}",
-            NODE_VALIDATOR_ADDRESS
+            addr
         );
     });
 }
@@ -128,140 +163,34 @@ fn is_private_url(url: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// JSON path extraction
-// ---------------------------------------------------------------------------
-
-fn extract_json_path<'a>(json: &'a JsonValue, path: &str) -> Option<&'a JsonValue> {
-    if path.is_empty() {
-        return Some(json);
-    }
-
-    let mut current = json;
-
-    for segment in path.split('.') {
-        if segment.is_empty() {
-            continue;
-        }
-
-        if let Some(bracket_pos) = segment.find('[') {
-            let key = &segment[..bracket_pos];
-            let idx_str = &segment[bracket_pos + 1..segment.len() - 1];
-
-            if !key.is_empty() {
-                current = current.get(key)?;
-            }
-
-            let idx: usize = idx_str.parse().ok()?;
-            current = current.get(idx)?;
-        } else {
-            current = current.get(segment)?;
-        }
-    }
-
-    Some(current)
-}
-
-// ---------------------------------------------------------------------------
-// JSON value → ABI-encoded bytes
-// ---------------------------------------------------------------------------
-
-fn encode_json_value(value: &JsonValue, response_type: u8) -> Result<Vec<u8>, String> {
-    match response_type {
-        // 0 = raw bytes
-        0 => {
-            let raw_str = match value {
-                JsonValue::String(s) => s.clone(),
-                other => other.to_string(),
-            };
-            let raw: Bytes = raw_str.into_bytes().into();
-            Ok((raw,).abi_encode_params())
-        }
-        // 1 = uint256
-        1 => {
-            let num = match value {
-                JsonValue::Number(n) => {
-                    if let Some(u) = n.as_u64() {
-                        u
-                    } else if let Some(f) = n.as_f64() {
-                        if f < 0.0 {
-                            return Err(format!("negative number cannot be uint256: {f}"));
-                        }
-                        f as u64
-                    } else {
-                        return Err(format!("cannot convert number to uint256: {n}"));
-                    }
-                }
-                JsonValue::String(s) => {
-                    let trimmed = s.trim().replace(',', "");
-                    if let Ok(u) = trimmed.parse::<u64>() {
-                        u
-                    } else if let Ok(f) = trimmed.parse::<f64>() {
-                        if f < 0.0 {
-                            return Err(format!("negative number cannot be uint256: {f}"));
-                        }
-                        f as u64
-                    } else {
-                        return Err(format!("cannot parse string as uint256: {s}"));
-                    }
-                }
-                JsonValue::Bool(b) => {
-                    if *b { 1 } else { 0 }
-                }
-                _ => return Err(format!("cannot convert {value} to uint256")),
-            };
-            Ok((U256::from(num),).abi_encode_params())
-        }
-        // 2 = string
-        2 => {
-            let s = match value {
-                JsonValue::String(s) => s.clone(),
-                other => other.to_string(),
-            };
-            Ok((s,).abi_encode_params())
-        }
-        // 3 = bool
-        3 => {
-            let b = match value {
-                JsonValue::Bool(b) => *b,
-                JsonValue::Number(n) => n.as_u64().map(|v| v != 0).unwrap_or(false),
-                JsonValue::String(s) => {
-                    matches!(s.to_lowercase().as_str(), "true" | "1" | "yes")
-                }
-                JsonValue::Null => false,
-                _ => true,
-            };
-            Ok((b,).abi_encode_params())
-        }
-        _ => Err(format!("invalid responseType: {response_type}")),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// HTTP call
+// HTTP call (blocking inside tokio)
 // ---------------------------------------------------------------------------
 
 fn perform_http_call(request: &ApiRequest) -> Result<JsonValue, String> {
+    eprintln!("[ExternEVM v2] HTTP response received, parsing...");
+
     let result = tokio::task::block_in_place(|| {
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_millis(HTTP_TIMEOUT_MS))
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            .map_err(|e| format!("HTTP client build error: {e}"))?;
+            .map_err(|e| format!("failed to build HTTP client: {e}"))?;
 
         let mut req_builder = match request.method.as_str() {
             "GET" => client.get(&request.url),
             "POST" => client.post(&request.url),
-            _ => return Err(format!("unsupported method: {}", request.method)),
+            other => return Err(format!("unsupported method: {other}")),
         };
 
-        req_builder = req_builder.header("User-Agent", "ExternEVM/0.5.0");
+        req_builder = req_builder.header("User-Agent", "ExternEVM/0.6.0");
 
+        // Parse custom headers if provided
         if !request.headers.is_empty() {
-            match serde_json::from_slice::<JsonValue>(&request.headers) {
+            match serde_json::from_slice::<serde_json::Value>(&request.headers) {
                 Ok(JsonValue::Object(map)) => {
                     for (key, val) in map {
-                        if let JsonValue::String(v) = val {
-                            req_builder = req_builder.header(&key, &v);
+                        if let Some(v) = val.as_str() {
+                            req_builder = req_builder.header(&key, v);
                         }
                     }
                 }
@@ -309,9 +238,112 @@ fn perform_http_call(request: &ApiRequest) -> Result<JsonValue, String> {
 }
 
 // ---------------------------------------------------------------------------
+// JSON path extraction
+// ---------------------------------------------------------------------------
+
+fn extract_json_path<'a>(json: &'a JsonValue, path: &str) -> Option<&'a JsonValue> {
+    if path.is_empty() {
+        return Some(json);
+    }
+
+    let mut current = json;
+
+    for segment in path.split('.') {
+        // Check for array indexing: "field[0]"
+        if let Some(bracket_pos) = segment.find('[') {
+            let field = &segment[..bracket_pos];
+            let idx_str = &segment[bracket_pos + 1..segment.len() - 1];
+
+            if !field.is_empty() {
+                current = current.get(field)?;
+            }
+
+            let idx: usize = idx_str.parse().ok()?;
+            current = current.get(idx)?;
+        } else {
+            current = current.get(segment)?;
+        }
+    }
+
+    Some(current)
+}
+
+// ---------------------------------------------------------------------------
+// JSON value → ABI-encoded bytes (direct, used as fallback)
+// ---------------------------------------------------------------------------
+
+fn encode_json_value(value: &JsonValue, response_type: u8) -> Result<Vec<u8>, String> {
+    match response_type {
+        // raw bytes
+        0 => {
+            let raw: Bytes = value.to_string().into_bytes().into();
+            Ok((raw,).abi_encode_params())
+        }
+        // uint256
+        1 => {
+            let num = match value {
+                JsonValue::Number(n) => {
+                    if let Some(u) = n.as_u64() {
+                        U256::from(u)
+                    } else if let Some(f) = n.as_f64() {
+                        U256::from(f as u64)
+                    } else {
+                        return Err("cannot convert number to uint256".into());
+                    }
+                }
+                JsonValue::String(s) => {
+                    let cleaned = s.replace(',', "");
+                    if let Ok(u) = cleaned.parse::<u64>() {
+                        U256::from(u)
+                    } else if let Ok(f) = cleaned.parse::<f64>() {
+                        U256::from(f as u64)
+                    } else {
+                        return Err(format!("cannot parse '{s}' as uint256"));
+                    }
+                }
+                JsonValue::Bool(b) => U256::from(if *b { 1u64 } else { 0u64 }),
+                _ => return Err("cannot convert to uint256".into()),
+            };
+            Ok((num,).abi_encode_params())
+        }
+        // string
+        2 => {
+            let s = match value {
+                JsonValue::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            Ok((s,).abi_encode_params())
+        }
+        // bool
+        3 => {
+            let b = match value {
+                JsonValue::Bool(b) => *b,
+                JsonValue::Number(n) => n.as_f64().map(|f| f != 0.0).unwrap_or(false),
+                JsonValue::String(s) => {
+                    matches!(s.to_lowercase().as_str(), "true" | "1" | "yes")
+                }
+                JsonValue::Null => false,
+                _ => false,
+            };
+            Ok((b,).abi_encode_params())
+        }
+        _ => Err(format!("invalid responseType: {response_type}")),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // v2 aggregation: collect submissions and compute median/majority
 // ---------------------------------------------------------------------------
 
+/// Given a request ID and response type, collect all validator submissions
+/// from the protocol store and compute the aggregated result.
+///
+/// For response_type 1 (uint256): computes median
+/// For response_type 2 (string): computes majority vote
+/// For response_type 3 (bool): computes majority vote
+/// For response_type 0 (bytes): computes majority vote on raw strings
+///
+/// Returns the ABI-encoded aggregated result.
 fn aggregate_submissions(
     request_id: &alloy_primitives::B256,
     response_type: u8,
@@ -442,13 +474,13 @@ fn api_call_precompile(input: PrecompileInput<'_>) -> PrecompileResult {
     // Ensure this node is registered as a validator
     ensure_validator_registered();
 
-    // Backward compatibility: empty input → uint256(1234)
+    // --- Backward compat: empty input → uint256(1234) ---
     if input.data.is_empty() {
         let output = (U256::from(1234u64),).abi_encode_params();
         return Ok(PrecompileOutput::new(gas_used, output.into(), input.reservoir));
     }
 
-    // --- Decode ABI-encoded ApiRequest ---
+    // --- Decode ABI input ---
     let request = match ApiRequest::abi_decode(input.data) {
         Ok(req) => req,
         Err(e) => {
@@ -460,17 +492,14 @@ fn api_call_precompile(input: PrecompileInput<'_>) -> PrecompileResult {
         }
     };
 
-    eprintln!("[ExternEVM v2] API_CALL decoded:");
-    eprintln!("  url:          {}", request.url);
-    eprintln!("  method:       {}", request.method);
-    eprintln!("  headers:      {} bytes", request.headers.len());
-    eprintln!("  body:         {} bytes", request.body.len());
-    eprintln!("  responsePath: {}", request.responsePath);
-    eprintln!("  responseType: {}", request.responseType);
+    eprintln!(
+        "[ExternEVM v2] API_CALL decoded:\n  url:          {}\n  method:       {}\n  headers:      {} bytes\n  body:         {} bytes\n  responsePath: {}\n  responseType: {}",
+        request.url, request.method, request.headers.len(), request.body.len(),
+        request.responsePath, request.responseType
+    );
 
     // --- Validation ---
     if request.url.is_empty() {
-        eprintln!("[ExternEVM v2] ERROR: url is empty");
         return Ok(PrecompileOutput::halt(
             PrecompileHalt::Other("API_CALL: url is empty".into()),
             input.reservoir,
@@ -478,7 +507,6 @@ fn api_call_precompile(input: PrecompileInput<'_>) -> PrecompileResult {
     }
 
     if !request.url.starts_with("http://") && !request.url.starts_with("https://") {
-        eprintln!("[ExternEVM v2] ERROR: url must start with http:// or https://");
         return Ok(PrecompileOutput::halt(
             PrecompileHalt::Other("API_CALL: url must start with http:// or https://".into()),
             input.reservoir,
@@ -486,7 +514,6 @@ fn api_call_precompile(input: PrecompileInput<'_>) -> PrecompileResult {
     }
 
     if is_private_url(&request.url) {
-        eprintln!("[ExternEVM v2] ERROR: private/loopback URLs are blocked");
         return Ok(PrecompileOutput::halt(
             PrecompileHalt::Other("API_CALL: private/loopback URLs are blocked".into()),
             input.reservoir,
@@ -494,60 +521,48 @@ fn api_call_precompile(input: PrecompileInput<'_>) -> PrecompileResult {
     }
 
     if request.method != "GET" && request.method != "POST" {
-        eprintln!("[ExternEVM v2] ERROR: invalid method '{}'", request.method);
         return Ok(PrecompileOutput::halt(
             PrecompileHalt::Other("API_CALL: method must be GET or POST".into()),
             input.reservoir,
         ));
     }
 
-    if request.responseType > 3 {
-        eprintln!("[ExternEVM v2] ERROR: invalid responseType {}", request.responseType);
-        return Ok(PrecompileOutput::halt(
-            PrecompileHalt::Other("API_CALL: responseType must be 0-3".into()),
-            input.reservoir,
-        ));
-    }
-
     if request.body.len() > MAX_BODY_SIZE {
-        eprintln!(
-            "[ExternEVM v2] ERROR: body size {} exceeds max {}",
-            request.body.len(),
-            MAX_BODY_SIZE
-        );
         return Ok(PrecompileOutput::halt(
             PrecompileHalt::Other("API_CALL: body exceeds max size".into()),
             input.reservoir,
         ));
     }
 
-    // --- HTTP call ---
+    if request.responseType > 3 {
+        return Ok(PrecompileOutput::halt(
+            PrecompileHalt::Other("API_CALL: responseType must be 0-3".into()),
+            input.reservoir,
+        ));
+    }
+
+    // --- Perform HTTP call ---
     let json = match perform_http_call(&request) {
-        Ok(json) => {
-            eprintln!("[ExternEVM v2] HTTP response received, parsing...");
-            json
-        }
+        Ok(j) => j,
         Err(e) => {
             eprintln!("[ExternEVM v2] HTTP error: {e}");
             return Ok(PrecompileOutput::halt(
-                PrecompileHalt::Other(format!("API_CALL: {e}").into()),
+                PrecompileHalt::Other(format!("API_CALL: HTTP error: {e}").into()),
                 input.reservoir,
             ));
         }
     };
 
-    // --- Extract value at responsePath ---
+    // --- Extract value at JSON path ---
     let extracted = match extract_json_path(&json, &request.responsePath) {
-        Some(val) => val,
+        Some(v) => v.clone(),
         None => {
             eprintln!(
-                "[ExternEVM v2] ERROR: responsePath '{}' not found in JSON",
+                "[ExternEVM v2] JSON path '{}' not found in response",
                 request.responsePath
             );
             return Ok(PrecompileOutput::halt(
-                PrecompileHalt::Other(
-                    format!("API_CALL: responsePath '{}' not found", request.responsePath).into(),
-                ),
+                PrecompileHalt::Other("API_CALL: JSON path not found".into()),
                 input.reservoir,
             ));
         }
@@ -560,11 +575,20 @@ fn api_call_precompile(input: PrecompileInput<'_>) -> PrecompileResult {
 
     // --- v2: Store value in protocol store and aggregate ---
     let store = global_store();
-    let request_id = store.generate_request_id(0, 0);
 
+    // Use a deterministic request hash for cross-node correlation.
+    // Every node calling the same API with same params gets the same hash.
+    let request_hash = compute_request_hash(
+        &request.url,
+        &request.method,
+        &request.responsePath,
+        request.responseType,
+    );
+
+    // Create a pending request in the store
     store.create_request(
-        request_id,
-        0,
+        request_hash,
+        0, // block_created placeholder
         request.url.clone(),
         request.method.clone(),
         request.headers.to_vec(),
@@ -573,23 +597,62 @@ fn api_call_precompile(input: PrecompileInput<'_>) -> PrecompileResult {
         request.responseType,
     );
 
-    // Store raw string representation of extracted value
-    let value_str = match extracted {
+    // Store this node's fetched value as raw string bytes
+    let value_str = match &extracted {
         JsonValue::String(s) => s.clone(),
         other => other.to_string(),
     };
 
+    let validator_addr = node_validator_address();
+
     if let Err(e) = store.submit_value(
-        request_id,
-        NODE_VALIDATOR_ADDRESS,
+        request_hash,
+        validator_addr,
         value_str.as_bytes().to_vec(),
-        0,
+        0, // block_submitted placeholder
     ) {
         eprintln!("[ExternEVM v2] Failed to store submission: {e}");
     }
 
+    // --- Broadcast to peers via extern/1 subprotocol ---
+    let raw_value_bytes = value_str.as_bytes().to_vec();
+
+    let broadcast_msg = ExternDataMsg {
+        request_hash,
+        value: raw_value_bytes,
+        response_type: request.responseType,
+        validator: validator_addr,
+    };
+
+    let tx = broadcast_sender();
+    match tx.send(broadcast_msg) {
+        Ok(receivers) => {
+            eprintln!(
+                "[ExternEVM v2] Broadcast value to {} peer connections",
+                receivers
+            );
+        }
+        Err(_) => {
+            eprintln!("[ExternEVM v2] No peers connected, broadcast skipped");
+        }
+    }
+
+    // --- Wait briefly for peer values ---
+    let peer_wait_ms: u64 = std::env::var("EXTERNEVM_PEER_WAIT_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(300);
+
+    if tx.receiver_count() > 0 {
+        eprintln!(
+            "[ExternEVM v2] Waiting {}ms for peer values...",
+            peer_wait_ms
+        );
+        std::thread::sleep(Duration::from_millis(peer_wait_ms));
+    }
+
     // --- Aggregate: compute median/majority from all submissions ---
-    match aggregate_submissions(&request_id, request.responseType) {
+    match aggregate_submissions(&request_hash, request.responseType) {
         Ok(encoded) => {
             eprintln!(
                 "[ExternEVM v2] Returning aggregated response ({} bytes, responseType={})",
@@ -603,7 +666,8 @@ fn api_call_precompile(input: PrecompileInput<'_>) -> PrecompileResult {
                 "[ExternEVM v2] Aggregation failed ({}), falling back to direct encode",
                 e
             );
-            match encode_json_value(extracted, request.responseType) {
+            // Fallback: encode directly from the extracted value (v1 behavior)
+            match encode_json_value(&extracted, request.responseType) {
                 Ok(encoded) => {
                     Ok(PrecompileOutput::new(gas_used, encoded.into(), input.reservoir))
                 }
@@ -631,7 +695,7 @@ pub fn inject_api_call_precompile(precompiles: &mut PrecompilesMap) {
 }
 
 // ---------------------------------------------------------------------------
-// ExternEvmFactory — EXACT copy of v1 trait impl
+// ExternEvmFactory
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Default)]
@@ -641,37 +705,45 @@ pub struct ExternEvmFactory {
 
 impl ExternEvmFactory {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            inner: alloy_evm::EthEvmFactory::default(),
+        }
     }
 }
 
 impl EvmFactory for ExternEvmFactory {
     type Evm<DB: Database, I: Inspector<EthEvmContext<DB>>> =
         <alloy_evm::EthEvmFactory as EvmFactory>::Evm<DB, I>;
-    type Context<DB: Database> = EthEvmContext<DB>;
+
+    type Context<DB: Database> =
+        <alloy_evm::EthEvmFactory as EvmFactory>::Context<DB>;
+
     type Tx = TxEnv;
-    type Error<DBError: core::error::Error + Send + Sync + 'static> = EVMError<DBError>;
+    type Error<DBError: core::error::Error + Send + Sync + 'static> = EVMError<DBError, HaltReason>;
     type HaltReason = HaltReason;
     type Spec = SpecId;
-    type BlockEnv = BlockEnv;
-    type Precompiles = PrecompilesMap;
 
-    fn create_evm<DB: Database>(
+    fn create_evm<DB: Database, I: Inspector<EthEvmContext<DB>>>(
         &self,
         db: DB,
-        input: EvmEnv,
-    ) -> Self::Evm<DB, NoOpInspector> {
-        let mut evm = self.inner.create_evm(db, input);
+        input: EvmEnv<Self::Tx, Self::Spec>,
+        inspector: I,
+    ) -> Self::Evm<DB, I> {
+        let mut evm = self.inner.create_evm(db, input, inspector);
         inject_api_call_precompile(evm.precompiles_mut());
         evm
     }
 
-    fn create_evm_with_inspector<DB: Database, I: Inspector<Self::Context<DB>>>(
+    fn create_evm_with_inspector<DB, I>(
         &self,
         db: DB,
-        input: EvmEnv,
+        input: EvmEnv<Self::Tx, Self::Spec>,
         inspector: I,
-    ) -> Self::Evm<DB, I> {
+    ) -> Self::Evm<DB, I>
+    where
+        DB: Database,
+        I: Inspector<EthEvmContext<DB>>,
+    {
         let mut evm = self.inner.create_evm_with_inspector(db, input, inspector);
         inject_api_call_precompile(evm.precompiles_mut());
         evm
