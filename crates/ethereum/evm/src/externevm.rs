@@ -1,11 +1,12 @@
-//! ExternEVM custom EvmFactory.
+//! ExternEVM custom EvmFactory — v2
 //!
 //! Wraps the standard `EthEvmFactory` and injects the API_CALL precompile
 //! at address 0x00000000000000000000000000000000000000AA.
 //!
-//! Milestone 1: any input → uint256(1234)
-//! Milestone 3: decode ApiRequest, validate, return mock responses
-//! Milestone 4: real HTTP calls via reqwest::blocking
+//! v1: Single node fetches API, returns result directly.
+//! v2: Node fetches API, stores value in protocol store, computes
+//!     median/majority across all submissions, returns aggregated result.
+//!     In single-node mode, behavior is identical to v1.
 
 use alloy_evm::{
     eth::EthEvmContext,
@@ -26,6 +27,11 @@ use revm::{
 use serde_json::Value as JsonValue;
 use std::time::Duration;
 
+use crate::protocol_store::{
+    global_store, compute_median_uint256, compute_majority_string,
+    compute_majority_bool,
+};
+
 /// The address of the API_CALL precompile: 0x00000000000000000000000000000000000000AA
 pub const API_CALL_ADDRESS: Address = {
     let mut addr = [0u8; 20];
@@ -45,6 +51,17 @@ const MAX_RESPONSE_SIZE: usize = 131072;
 /// HTTP timeout in milliseconds.
 const HTTP_TIMEOUT_MS: u64 = 5000;
 
+/// This node's validator identity address (dev mode: first pre-funded account).
+const NODE_VALIDATOR_ADDRESS: Address = {
+    let mut addr = [0u8; 20];
+    addr[0] = 0xf3; addr[1] = 0x9F; addr[2] = 0xd6; addr[3] = 0xe5;
+    addr[4] = 0x1a; addr[5] = 0xad; addr[6] = 0x88; addr[7] = 0xF6;
+    addr[8] = 0xF4; addr[9] = 0xce; addr[10] = 0x6a; addr[11] = 0xB8;
+    addr[12] = 0x82; addr[13] = 0x72; addr[14] = 0x79; addr[15] = 0xcf;
+    addr[16] = 0xfF; addr[17] = 0xb9; addr[18] = 0x22; addr[19] = 0x66;
+    Address::new(addr)
+};
+
 // ---------------------------------------------------------------------------
 // ABI struct definition — matches the Solidity struct exactly.
 // ---------------------------------------------------------------------------
@@ -58,6 +75,23 @@ sol! {
         string responsePath;
         uint8 responseType;
     }
+}
+
+// ---------------------------------------------------------------------------
+// One-time initialization
+// ---------------------------------------------------------------------------
+
+fn ensure_validator_registered() {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        let store = global_store();
+        store.register_validator(NODE_VALIDATOR_ADDRESS);
+        eprintln!(
+            "[ExternEVM v2] Registered self as validator: {:?}",
+            NODE_VALIDATOR_ADDRESS
+        );
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -94,15 +128,9 @@ fn is_private_url(url: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// JSON path extraction — supports dot notation and array indexing
+// JSON path extraction
 // ---------------------------------------------------------------------------
 
-/// Navigate a JSON value by a path like "bpi.USD.rate_float" or "periods[0].temperature"
-///
-/// Supports:
-///   - Dot-separated keys: "data.price"
-///   - Array indexing: "periods[0].temperature"
-///   - Top-level keys: "price"
 fn extract_json_path<'a>(json: &'a JsonValue, path: &str) -> Option<&'a JsonValue> {
     if path.is_empty() {
         return Some(json);
@@ -115,17 +143,14 @@ fn extract_json_path<'a>(json: &'a JsonValue, path: &str) -> Option<&'a JsonValu
             continue;
         }
 
-        // Check for array indexing: "periods[0]"
         if let Some(bracket_pos) = segment.find('[') {
             let key = &segment[..bracket_pos];
-            let idx_str = &segment[bracket_pos + 1..segment.len() - 1]; // strip [ and ]
+            let idx_str = &segment[bracket_pos + 1..segment.len() - 1];
 
-            // Navigate to the key first (if non-empty)
             if !key.is_empty() {
                 current = current.get(key)?;
             }
 
-            // Then index into the array
             let idx: usize = idx_str.parse().ok()?;
             current = current.get(idx)?;
         } else {
@@ -137,12 +162,12 @@ fn extract_json_path<'a>(json: &'a JsonValue, path: &str) -> Option<&'a JsonValu
 }
 
 // ---------------------------------------------------------------------------
-// Convert extracted JSON value to the requested type and ABI-encode
+// JSON value → ABI-encoded bytes
 // ---------------------------------------------------------------------------
 
 fn encode_json_value(value: &JsonValue, response_type: u8) -> Result<Vec<u8>, String> {
     match response_type {
-        // 0 = raw bytes (JSON value as UTF-8)
+        // 0 = raw bytes
         0 => {
             let raw_str = match value {
                 JsonValue::String(s) => s.clone(),
@@ -158,7 +183,6 @@ fn encode_json_value(value: &JsonValue, response_type: u8) -> Result<Vec<u8>, St
                     if let Some(u) = n.as_u64() {
                         u
                     } else if let Some(f) = n.as_f64() {
-                        // Truncate float to integer (e.g. 72.5 → 72)
                         if f < 0.0 {
                             return Err(format!("negative number cannot be uint256: {f}"));
                         }
@@ -168,7 +192,6 @@ fn encode_json_value(value: &JsonValue, response_type: u8) -> Result<Vec<u8>, St
                     }
                 }
                 JsonValue::String(s) => {
-                    // Try parsing string as number (some APIs return numbers as strings)
                     let trimmed = s.trim().replace(',', "");
                     if let Ok(u) = trimmed.parse::<u64>() {
                         u
@@ -205,7 +228,7 @@ fn encode_json_value(value: &JsonValue, response_type: u8) -> Result<Vec<u8>, St
                     matches!(s.to_lowercase().as_str(), "true" | "1" | "yes")
                 }
                 JsonValue::Null => false,
-                _ => true, // objects/arrays are truthy
+                _ => true,
             };
             Ok((b,).abi_encode_params())
         }
@@ -214,12 +237,10 @@ fn encode_json_value(value: &JsonValue, response_type: u8) -> Result<Vec<u8>, St
 }
 
 // ---------------------------------------------------------------------------
-// Perform the actual HTTP call
+// HTTP call
 // ---------------------------------------------------------------------------
 
 fn perform_http_call(request: &ApiRequest) -> Result<JsonValue, String> {
-    // reqwest::blocking can panic inside a tokio runtime, so we use
-    // tokio::task::block_in_place to allow blocking within the async context.
     let result = tokio::task::block_in_place(|| {
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_millis(HTTP_TIMEOUT_MS))
@@ -227,18 +248,14 @@ fn perform_http_call(request: &ApiRequest) -> Result<JsonValue, String> {
             .build()
             .map_err(|e| format!("HTTP client build error: {e}"))?;
 
-        // Build the request
         let mut req_builder = match request.method.as_str() {
             "GET" => client.get(&request.url),
             "POST" => client.post(&request.url),
             _ => return Err(format!("unsupported method: {}", request.method)),
         };
 
-        // Always set a User-Agent — many APIs (weather.gov, CoinGecko) reject
-        // requests without one.
-        req_builder = req_builder.header("User-Agent", "ExternEVM/0.4.0");
+        req_builder = req_builder.header("User-Agent", "ExternEVM/0.5.0");
 
-        // Parse and apply headers from bytes (expected to be JSON: {"Key": "Value", ...})
         if !request.headers.is_empty() {
             match serde_json::from_slice::<JsonValue>(&request.headers) {
                 Ok(JsonValue::Object(map)) => {
@@ -257,23 +274,19 @@ fn perform_http_call(request: &ApiRequest) -> Result<JsonValue, String> {
             }
         }
 
-        // Set body for POST
         if request.method == "POST" && !request.body.is_empty() {
             req_builder = req_builder.body(request.body.to_vec());
         }
 
-        // Send the request
         let response = req_builder
             .send()
             .map_err(|e| format!("HTTP request failed: {e}"))?;
 
-        // Check status
         let status = response.status();
         if !status.is_success() {
             return Err(format!("HTTP {status}"));
         }
 
-        // Read response body with size limit
         let body_bytes = response
             .bytes()
             .map_err(|e| format!("failed to read response body: {e}"))?;
@@ -286,7 +299,6 @@ fn perform_http_call(request: &ApiRequest) -> Result<JsonValue, String> {
             ));
         }
 
-        // Parse JSON
         let json: JsonValue = serde_json::from_slice(&body_bytes)
             .map_err(|e| format!("failed to parse response JSON: {e}"))?;
 
@@ -294,6 +306,122 @@ fn perform_http_call(request: &ApiRequest) -> Result<JsonValue, String> {
     });
 
     result
+}
+
+// ---------------------------------------------------------------------------
+// v2 aggregation: collect submissions and compute median/majority
+// ---------------------------------------------------------------------------
+
+fn aggregate_submissions(
+    request_id: &alloy_primitives::B256,
+    response_type: u8,
+) -> Result<Vec<u8>, String> {
+    let store = global_store();
+    let submissions = store.get_submissions(request_id);
+
+    if submissions.is_empty() {
+        return Err("No submissions found for request".to_string());
+    }
+
+    let num_submissions = submissions.len();
+
+    match response_type {
+        // uint256 — median
+        1 => {
+            let mut values: Vec<U256> = Vec::new();
+            for sub in &submissions {
+                let value_str = String::from_utf8(sub.value.clone())
+                    .map_err(|_| "invalid UTF-8 in submission value")?;
+                let cleaned = value_str.trim().replace(',', "");
+                let num = cleaned
+                    .parse::<f64>()
+                    .map_err(|_| format!("cannot parse submission as number: {value_str}"))?;
+                if num < 0.0 {
+                    return Err(format!("negative value in submission: {num}"));
+                }
+                values.push(U256::from(num as u64));
+            }
+
+            let median = compute_median_uint256(&mut values)
+                .ok_or("empty values for median")?;
+
+            eprintln!(
+                "[ExternEVM v2] Aggregation: {} submissions, values={:?}, median={}",
+                num_submissions, values, median
+            );
+
+            Ok((median,).abi_encode_params())
+        }
+
+        // string — majority vote
+        2 => {
+            let values: Vec<String> = submissions
+                .iter()
+                .filter_map(|s| String::from_utf8(s.value.clone()).ok())
+                .collect();
+
+            match compute_majority_string(&values) {
+                Some(result) => {
+                    eprintln!(
+                        "[ExternEVM v2] Aggregation: {} submissions, majority string={}",
+                        num_submissions, result
+                    );
+                    Ok((result,).abi_encode_params())
+                }
+                None => {
+                    eprintln!(
+                        "[ExternEVM v2] No majority for string, using first submission"
+                    );
+                    let fallback = values.into_iter().next()
+                        .ok_or("no string values")?;
+                    Ok((fallback,).abi_encode_params())
+                }
+            }
+        }
+
+        // bool — majority vote
+        3 => {
+            let values: Vec<bool> = submissions
+                .iter()
+                .filter_map(|s| {
+                    String::from_utf8(s.value.clone()).ok().map(|s| {
+                        matches!(s.trim().to_lowercase().as_str(), "true" | "1" | "yes")
+                    })
+                })
+                .collect();
+
+            match compute_majority_bool(&values) {
+                Some(result) => {
+                    eprintln!(
+                        "[ExternEVM v2] Aggregation: {} submissions, majority bool={}",
+                        num_submissions, result
+                    );
+                    Ok((result,).abi_encode_params())
+                }
+                None => {
+                    let fallback = values.into_iter().next().unwrap_or(false);
+                    Ok((fallback,).abi_encode_params())
+                }
+            }
+        }
+
+        // raw bytes — majority vote on string representation
+        0 => {
+            let values: Vec<String> = submissions
+                .iter()
+                .filter_map(|s| String::from_utf8(s.value.clone()).ok())
+                .collect();
+
+            let result = compute_majority_string(&values)
+                .or_else(|| values.into_iter().next())
+                .ok_or("no raw byte values")?;
+
+            let raw_bytes: Bytes = result.into_bytes().into();
+            Ok((raw_bytes,).abi_encode_params())
+        }
+
+        _ => Err(format!("invalid responseType for aggregation: {response_type}")),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -311,6 +439,9 @@ fn api_call_precompile(input: PrecompileInput<'_>) -> PrecompileResult {
         return Ok(PrecompileOutput::halt(PrecompileHalt::OutOfGas, input.reservoir));
     }
 
+    // Ensure this node is registered as a validator
+    ensure_validator_registered();
+
     // Backward compatibility: empty input → uint256(1234)
     if input.data.is_empty() {
         let output = (U256::from(1234u64),).abi_encode_params();
@@ -321,7 +452,7 @@ fn api_call_precompile(input: PrecompileInput<'_>) -> PrecompileResult {
     let request = match ApiRequest::abi_decode(input.data) {
         Ok(req) => req,
         Err(e) => {
-            eprintln!("[ExternEVM] ABI decode error: {e}");
+            eprintln!("[ExternEVM v2] ABI decode error: {e}");
             return Ok(PrecompileOutput::halt(
                 PrecompileHalt::Other("API_CALL: failed to decode ApiRequest".into()),
                 input.reservoir,
@@ -329,7 +460,7 @@ fn api_call_precompile(input: PrecompileInput<'_>) -> PrecompileResult {
         }
     };
 
-    eprintln!("[ExternEVM] API_CALL decoded:");
+    eprintln!("[ExternEVM v2] API_CALL decoded:");
     eprintln!("  url:          {}", request.url);
     eprintln!("  method:       {}", request.method);
     eprintln!("  headers:      {} bytes", request.headers.len());
@@ -339,7 +470,7 @@ fn api_call_precompile(input: PrecompileInput<'_>) -> PrecompileResult {
 
     // --- Validation ---
     if request.url.is_empty() {
-        eprintln!("[ExternEVM] ERROR: url is empty");
+        eprintln!("[ExternEVM v2] ERROR: url is empty");
         return Ok(PrecompileOutput::halt(
             PrecompileHalt::Other("API_CALL: url is empty".into()),
             input.reservoir,
@@ -347,7 +478,7 @@ fn api_call_precompile(input: PrecompileInput<'_>) -> PrecompileResult {
     }
 
     if !request.url.starts_with("http://") && !request.url.starts_with("https://") {
-        eprintln!("[ExternEVM] ERROR: url must start with http:// or https://");
+        eprintln!("[ExternEVM v2] ERROR: url must start with http:// or https://");
         return Ok(PrecompileOutput::halt(
             PrecompileHalt::Other("API_CALL: url must start with http:// or https://".into()),
             input.reservoir,
@@ -355,7 +486,7 @@ fn api_call_precompile(input: PrecompileInput<'_>) -> PrecompileResult {
     }
 
     if is_private_url(&request.url) {
-        eprintln!("[ExternEVM] ERROR: private/loopback URLs are blocked");
+        eprintln!("[ExternEVM v2] ERROR: private/loopback URLs are blocked");
         return Ok(PrecompileOutput::halt(
             PrecompileHalt::Other("API_CALL: private/loopback URLs are blocked".into()),
             input.reservoir,
@@ -363,7 +494,7 @@ fn api_call_precompile(input: PrecompileInput<'_>) -> PrecompileResult {
     }
 
     if request.method != "GET" && request.method != "POST" {
-        eprintln!("[ExternEVM] ERROR: invalid method '{}'", request.method);
+        eprintln!("[ExternEVM v2] ERROR: invalid method '{}'", request.method);
         return Ok(PrecompileOutput::halt(
             PrecompileHalt::Other("API_CALL: method must be GET or POST".into()),
             input.reservoir,
@@ -371,7 +502,7 @@ fn api_call_precompile(input: PrecompileInput<'_>) -> PrecompileResult {
     }
 
     if request.responseType > 3 {
-        eprintln!("[ExternEVM] ERROR: invalid responseType {}", request.responseType);
+        eprintln!("[ExternEVM v2] ERROR: invalid responseType {}", request.responseType);
         return Ok(PrecompileOutput::halt(
             PrecompileHalt::Other("API_CALL: responseType must be 0-3".into()),
             input.reservoir,
@@ -380,7 +511,7 @@ fn api_call_precompile(input: PrecompileInput<'_>) -> PrecompileResult {
 
     if request.body.len() > MAX_BODY_SIZE {
         eprintln!(
-            "[ExternEVM] ERROR: body size {} exceeds max {}",
+            "[ExternEVM v2] ERROR: body size {} exceeds max {}",
             request.body.len(),
             MAX_BODY_SIZE
         );
@@ -390,14 +521,14 @@ fn api_call_precompile(input: PrecompileInput<'_>) -> PrecompileResult {
         ));
     }
 
-    // --- Milestone 4: Real HTTP call ---
+    // --- HTTP call ---
     let json = match perform_http_call(&request) {
         Ok(json) => {
-            eprintln!("[ExternEVM] HTTP response received, parsing...");
+            eprintln!("[ExternEVM v2] HTTP response received, parsing...");
             json
         }
         Err(e) => {
-            eprintln!("[ExternEVM] HTTP error: {e}");
+            eprintln!("[ExternEVM v2] HTTP error: {e}");
             return Ok(PrecompileOutput::halt(
                 PrecompileHalt::Other(format!("API_CALL: {e}").into()),
                 input.reservoir,
@@ -410,10 +541,9 @@ fn api_call_precompile(input: PrecompileInput<'_>) -> PrecompileResult {
         Some(val) => val,
         None => {
             eprintln!(
-                "[ExternEVM] ERROR: responsePath '{}' not found in JSON",
+                "[ExternEVM v2] ERROR: responsePath '{}' not found in JSON",
                 request.responsePath
             );
-            eprintln!("[ExternEVM] JSON body: {json}");
             return Ok(PrecompileOutput::halt(
                 PrecompileHalt::Other(
                     format!("API_CALL: responsePath '{}' not found", request.responsePath).into(),
@@ -424,30 +554,73 @@ fn api_call_precompile(input: PrecompileInput<'_>) -> PrecompileResult {
     };
 
     eprintln!(
-        "[ExternEVM] Extracted value at '{}': {}",
+        "[ExternEVM v2] Extracted value at '{}': {}",
         request.responsePath, extracted
     );
 
-    // --- Encode to the requested type ---
-    let output_bytes = match encode_json_value(extracted, request.responseType) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            eprintln!("[ExternEVM] Encoding error: {e}");
-            return Ok(PrecompileOutput::halt(
-                PrecompileHalt::Other(format!("API_CALL: {e}").into()),
-                input.reservoir,
-            ));
-        }
-    };
+    // --- v2: Store value in protocol store and aggregate ---
+    let store = global_store();
+    let request_id = store.generate_request_id(0, 0);
 
-    eprintln!(
-        "[ExternEVM] Returning real response ({} bytes, responseType={})",
-        output_bytes.len(),
-        request.responseType
+    store.create_request(
+        request_id,
+        0,
+        request.url.clone(),
+        request.method.clone(),
+        request.headers.to_vec(),
+        request.body.to_vec(),
+        request.responsePath.clone(),
+        request.responseType,
     );
 
-    Ok(PrecompileOutput::new(gas_used, output_bytes.into(), input.reservoir))
+    // Store raw string representation of extracted value
+    let value_str = match extracted {
+        JsonValue::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+
+    if let Err(e) = store.submit_value(
+        request_id,
+        NODE_VALIDATOR_ADDRESS,
+        value_str.as_bytes().to_vec(),
+        0,
+    ) {
+        eprintln!("[ExternEVM v2] Failed to store submission: {e}");
+    }
+
+    // --- Aggregate: compute median/majority from all submissions ---
+    match aggregate_submissions(&request_id, request.responseType) {
+        Ok(encoded) => {
+            eprintln!(
+                "[ExternEVM v2] Returning aggregated response ({} bytes, responseType={})",
+                encoded.len(),
+                request.responseType
+            );
+            Ok(PrecompileOutput::new(gas_used, encoded.into(), input.reservoir))
+        }
+        Err(e) => {
+            eprintln!(
+                "[ExternEVM v2] Aggregation failed ({}), falling back to direct encode",
+                e
+            );
+            match encode_json_value(extracted, request.responseType) {
+                Ok(encoded) => {
+                    Ok(PrecompileOutput::new(gas_used, encoded.into(), input.reservoir))
+                }
+                Err(e2) => {
+                    Ok(PrecompileOutput::halt(
+                        PrecompileHalt::Other(format!("API_CALL: encode error: {e2}").into()),
+                        input.reservoir,
+                    ))
+                }
+            }
+        }
+    }
 }
+
+// ---------------------------------------------------------------------------
+// Precompile registration
+// ---------------------------------------------------------------------------
 
 fn api_call_dyn_precompile() -> DynPrecompile {
     DynPrecompile::new_stateful(api_call_id(), api_call_precompile)
@@ -458,7 +631,7 @@ pub fn inject_api_call_precompile(precompiles: &mut PrecompilesMap) {
 }
 
 // ---------------------------------------------------------------------------
-// ExternEvmFactory
+// ExternEvmFactory — EXACT copy of v1 trait impl
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Default)]
