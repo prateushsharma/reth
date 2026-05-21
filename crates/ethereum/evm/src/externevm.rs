@@ -18,18 +18,18 @@ use alloy_evm::{
 use alloy_primitives::{Address, Bytes, U256};
 use alloy_sol_types::{SolValue, sol};
 use revm::{
-    context::{BlockEnv, TxEnv},
-    context_interface::result::{EVMError, HaltReason},
+
+
     inspector::NoOpInspector,
     precompile::{PrecompileHalt, PrecompileId, PrecompileOutput, PrecompileResult},
-    primitives::hardfork::SpecId,
+
     Inspector,
 };
 use serde_json::Value as JsonValue;
 use std::time::Duration;
 
 use crate::protocol_store::{
-    self, global_store, compute_median_uint256, compute_majority_string,
+    global_store, compute_median_uint256, compute_majority_string,
     compute_majority_bool,
 };
 use crate::extern_proto::{broadcast_sender, compute_request_hash, ExternDataMsg};
@@ -714,36 +714,32 @@ impl ExternEvmFactory {
 impl EvmFactory for ExternEvmFactory {
     type Evm<DB: Database, I: Inspector<EthEvmContext<DB>>> =
         <alloy_evm::EthEvmFactory as EvmFactory>::Evm<DB, I>;
-
     type Context<DB: Database> =
         <alloy_evm::EthEvmFactory as EvmFactory>::Context<DB>;
+    type Tx = <alloy_evm::EthEvmFactory as EvmFactory>::Tx;
+    type Error<DBError: core::error::Error + Send + Sync + 'static> =
+        <alloy_evm::EthEvmFactory as EvmFactory>::Error<DBError>;
+    type HaltReason = <alloy_evm::EthEvmFactory as EvmFactory>::HaltReason;
+    type Spec = <alloy_evm::EthEvmFactory as EvmFactory>::Spec;
+    type BlockEnv = <alloy_evm::EthEvmFactory as EvmFactory>::BlockEnv;
+    type Precompiles = <alloy_evm::EthEvmFactory as EvmFactory>::Precompiles;
 
-    type Tx = TxEnv;
-    type Error<DBError: core::error::Error + Send + Sync + 'static> = EVMError<DBError, HaltReason>;
-    type HaltReason = HaltReason;
-    type Spec = SpecId;
-
-    fn create_evm<DB: Database, I: Inspector<EthEvmContext<DB>>>(
+    fn create_evm<DB: Database>(
         &self,
         db: DB,
-        input: EvmEnv<Self::Tx, Self::Spec>,
-        inspector: I,
-    ) -> Self::Evm<DB, I> {
-        let mut evm = self.inner.create_evm(db, input, inspector);
+        evm_env: EvmEnv<Self::Spec, Self::BlockEnv>,
+    ) -> Self::Evm<DB, NoOpInspector> {
+        let mut evm = self.inner.create_evm(db, evm_env);
         inject_api_call_precompile(evm.precompiles_mut());
         evm
     }
 
-    fn create_evm_with_inspector<DB, I>(
+    fn create_evm_with_inspector<DB: Database, I: Inspector<Self::Context<DB>>>(
         &self,
         db: DB,
-        input: EvmEnv<Self::Tx, Self::Spec>,
+        input: EvmEnv<Self::Spec, Self::BlockEnv>,
         inspector: I,
-    ) -> Self::Evm<DB, I>
-    where
-        DB: Database,
-        I: Inspector<EthEvmContext<DB>>,
-    {
+    ) -> Self::Evm<DB, I> {
         let mut evm = self.inner.create_evm_with_inspector(db, input, inspector);
         inject_api_call_precompile(evm.precompiles_mut());
         evm

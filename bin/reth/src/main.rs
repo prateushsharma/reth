@@ -1,40 +1,30 @@
-let handle = builder
-    .with_types::<EthereumNode>()
-    .with_components(
-        EthereumNode::components()
-            .executor(ExternEvmExecutorBuilder),
-    )
-    .with_add_ons(EthereumAddOns::default())
-    .on_component_initialized(move |ctx| {
-        ctx.components().network().add_rlpx_sub_protocol(
-            ExternEvmProtoHandler::new(validator_addr)
-        );
-        eprintln!("[ExternEVM] Registered extern/1 subprotocol");
-        Ok(())
-    })
-    .launch()
-    .await?;//! ExternEVM — Modified Reth node with API_CALL precompile + extern/1 p2p subprotocol
+//! ExternEVM — Modified Reth node with API_CALL precompile + extern/1 p2p subprotocol
+
+mod extern_p2p;
 
 use reth::cli::Cli;
-use reth_ethereum_evm::externevm::ExternEvmFactory;
-use reth_ethereum_evm::extern_proto::ExternEvmProtoHandler;
+use reth_evm_ethereum::externevm::ExternEvmFactory;
+use reth_network::NetworkProtocols;
+use reth_network::protocol::IntoRlpxSubProtocol;
 use reth_node_builder::{
     components::ExecutorBuilder, BuilderContext, FullNodeTypes,
 };
 use reth_node_ethereum::{node::EthereumAddOns, EthereumNode};
 
-use alloy_evm::EthEvmConfig;
+use reth_evm_ethereum::EthEvmConfig;
 use alloy_primitives::Address;
 
+use crate::extern_p2p::ExternEvmProtoHandler;
+
 // ---------------------------------------------------------------------------
-// Executor builder — injects our ExternEvmFactory into the EVM pipeline
+// Executor builder
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Default, Clone)]
 struct ExternEvmExecutorBuilder;
 
-impl<Node: FullNodeTypes> ExecutorBuilder<Node> for ExternEvmExecutorBuilder {
-    type EVM = EthEvmConfig<ExternEvmFactory>;
+impl<Node: FullNodeTypes<Types: reth_node_api::NodeTypes<ChainSpec = reth_chainspec::ChainSpec, Primitives = reth_ethereum_primitives::EthPrimitives>>> ExecutorBuilder<Node> for ExternEvmExecutorBuilder {
+    type EVM = EthEvmConfig<reth_chainspec::ChainSpec, ExternEvmFactory>;
 
     async fn build_evm(
         self,
@@ -52,8 +42,6 @@ impl<Node: FullNodeTypes> ExecutorBuilder<Node> for ExternEvmExecutorBuilder {
 // Validator address from env
 // ---------------------------------------------------------------------------
 
-/// Read the validator address from EXTERNEVM_VALIDATOR_ADDRESS env var.
-/// Falls back to the first Hardhat/Anvil dev account.
 fn get_validator_address() -> Address {
     if let Ok(hex_str) = std::env::var("EXTERNEVM_VALIDATOR_ADDRESS") {
         let hex_str = hex_str.trim().strip_prefix("0x").unwrap_or(hex_str.trim());
@@ -72,7 +60,6 @@ fn get_validator_address() -> Address {
         }
         eprintln!("[ExternEVM] Invalid EXTERNEVM_VALIDATOR_ADDRESS env var, using default");
     }
-    // Default: 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266
     let mut addr = [0u8; 20];
     addr[0] = 0xf3; addr[1] = 0x9F; addr[2] = 0xd6; addr[3] = 0xe5;
     addr[4] = 0x1a; addr[5] = 0xad; addr[6] = 0x88; addr[7] = 0xF6;
@@ -87,7 +74,6 @@ fn get_validator_address() -> Address {
 // ---------------------------------------------------------------------------
 
 fn main() {
-    // Determine validator address early so we can log it
     let validator_addr = get_validator_address();
     eprintln!("[ExternEVM] Node validator address: {:?}", validator_addr);
 
@@ -103,12 +89,10 @@ fn main() {
                 .launch()
                 .await?;
 
-            // Register the extern/1 subprotocol AFTER launch via NetworkHandle.
-            // This is the most compatible approach across Reth versions —
-            // NetworkHandle::add_rlpx_sub_protocol() is available on all recent builds.
+            // Register extern/1 subprotocol after launch
             let network = handle.node.network.clone();
             network.add_rlpx_sub_protocol(
-                ExternEvmProtoHandler::new(validator_addr)
+                ExternEvmProtoHandler::new(validator_addr).into_rlpx_sub_protocol()
             );
             eprintln!(
                 "[ExternEVM] Registered extern/1 subprotocol for p2p value broadcasting"
