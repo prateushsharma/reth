@@ -1,8 +1,11 @@
 //! ExternEVM custom devp2p subprotocol — shared types and broadcast channels.
 //!
-//! v3 adds ExternCommitMsg and ExternRevealMsg alongside the existing
-//! ExternDataMsg. Each has its own broadcast channel so extern_p2p.rs
-//! can fan-out all three message types to peers independently.
+//! v3 added ExternCommitMsg and ExternRevealMsg alongside ExternDataMsg.
+//! v4 extends ExternRevealMsg with a TLS certificate attestation: the
+//! designated fetcher signs a digest binding the revealed value to a genuine
+//! TLS session with a certificate-validated domain. The shared
+//! `compute_attestation_digest` helper guarantees signer and verifier hash
+//! identical bytes.
 
 use alloy_primitives::{Address, B256};
 use alloy_rlp::{RlpDecodable, RlpEncodable};
@@ -16,7 +19,7 @@ const BROADCAST_CHANNEL_CAPACITY: usize = 256;
 
 pub const MSG_TYPE_DATA:   u8 = 0x00; // v2 compat
 pub const MSG_TYPE_COMMIT: u8 = 0x01; // v3
-pub const MSG_TYPE_REVEAL: u8 = 0x02; // v3
+pub const MSG_TYPE_REVEAL: u8 = 0x02; // v3 + v4 (reveal now carries attestation)
 
 // ---------------------------------------------------------------------------
 // Message structs
@@ -39,13 +42,26 @@ pub struct ExternCommitMsg {
     pub validator: Address,
 }
 
-/// v3 phase 2: reveal broadcast — exposes value + salt for verification
+/// v3 phase 2 + v4 attestation: reveal broadcast.
+///
+/// v3 fields expose value + salt for commit-reveal verification.
+/// v4 fields carry the TLS certificate attestation:
+///   - `cert_der`        : server leaf certificate, DER-encoded
+///   - `response_hash`   : keccak256 of the raw response body bytes
+///   - `timestamp_secs`  : unix seconds when the fetch occurred
+///   - `attestation_sig` : 65-byte secp256k1 recoverable signature over
+///                         `compute_attestation_digest(...)`
 #[derive(Clone, Debug, PartialEq, Eq, RlpEncodable, RlpDecodable)]
 pub struct ExternRevealMsg {
     pub request_hash: B256,
     pub value: Vec<u8>,
     pub salt: B256, // 32-byte random salt, B256 implements RLP
     pub validator: Address,
+    // v4 additions:
+    pub cert_der: Vec<u8>,
+    pub response_hash: B256,
+    pub timestamp_secs: u64,
+    pub attestation_sig: Vec<u8>, // 65 bytes, secp256k1 recoverable
 }
 
 // ---------------------------------------------------------------------------
@@ -105,6 +121,47 @@ pub fn compute_request_hash(
 }
 
 // ---------------------------------------------------------------------------
+// Attestation digest helper (v4)
+// ---------------------------------------------------------------------------
+
+/// Compute the digest the designated fetcher signs to attest a TLS session.
+///
+/// digest = keccak256(
+///     request_hash      ‖ 0xFF ‖
+///     domain            ‖ 0xFF ‖
+///     keccak256(cert_der) ‖ 0xFF ‖   // cert fingerprint
+///     response_hash     ‖ 0xFF ‖
+///     timestamp_secs (big-endian u64)
+/// )
+///
+/// Both signer (externevm.rs) and verifier (extern_p2p.rs) MUST call this so
+/// the bytes hashed are byte-for-byte identical. The cert fingerprint is
+/// derived from the DER inside this function — callers pass the raw DER, never
+/// a pre-hashed fingerprint, removing any chance of the two sides disagreeing
+/// on how the fingerprint is formed.
+pub fn compute_attestation_digest(
+    request_hash: B256,
+    domain: &str,
+    cert_der: &[u8],
+    response_hash: B256,
+    timestamp_secs: u64,
+) -> B256 {
+    use alloy_primitives::keccak256;
+    let cert_fingerprint = keccak256(cert_der);
+    let mut data = Vec::new();
+    data.extend_from_slice(request_hash.as_slice());
+    data.push(0xFF);
+    data.extend_from_slice(domain.as_bytes());
+    data.push(0xFF);
+    data.extend_from_slice(cert_fingerprint.as_slice());
+    data.push(0xFF);
+    data.extend_from_slice(response_hash.as_slice());
+    data.push(0xFF);
+    data.extend_from_slice(&timestamp_secs.to_be_bytes());
+    keccak256(&data)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -147,6 +204,10 @@ mod tests {
             value: vec![0u8; 32],
             salt: B256::from([0xDDu8; 32]),
             validator: Address::from([0x02u8; 20]),
+            cert_der: vec![0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02],
+            response_hash: B256::from([0xEEu8; 32]),
+            timestamp_secs: 1_700_000_000,
+            attestation_sig: vec![0x7Au8; 65],
         };
         let mut buf = alloy_rlp::BytesMut::new();
         msg.encode(&mut buf);
@@ -161,6 +222,26 @@ mod tests {
         assert_eq!(h1, h2);
         let h3 = compute_request_hash("https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd", "GET", "ethereum.usd", 1);
         assert_ne!(h1, h3);
+    }
+
+    #[test]
+    fn test_compute_attestation_digest_deterministic() {
+        let rh = B256::from([0x01u8; 32]);
+        let resp = B256::from([0x02u8; 32]);
+        let cert = vec![0xDEu8, 0xAD, 0xBE, 0xEF];
+        let ts = 1_700_000_000u64;
+
+        // same inputs → same digest
+        let d1 = compute_attestation_digest(rh, "api.coingecko.com", &cert, resp, ts);
+        let d2 = compute_attestation_digest(rh, "api.coingecko.com", &cert, resp, ts);
+        assert_eq!(d1, d2);
+
+        // changing any single input changes the digest
+        assert_ne!(d1, compute_attestation_digest(B256::from([0xFFu8; 32]), "api.coingecko.com", &cert, resp, ts));
+        assert_ne!(d1, compute_attestation_digest(rh, "api.evil.com", &cert, resp, ts));
+        assert_ne!(d1, compute_attestation_digest(rh, "api.coingecko.com", &[0x00u8], resp, ts));
+        assert_ne!(d1, compute_attestation_digest(rh, "api.coingecko.com", &cert, B256::from([0x99u8; 32]), ts));
+        assert_ne!(d1, compute_attestation_digest(rh, "api.coingecko.com", &cert, resp, ts + 1));
     }
 
     #[test]

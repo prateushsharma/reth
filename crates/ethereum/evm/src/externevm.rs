@@ -1,11 +1,14 @@
-//! ExternEVM custom EvmFactory — v3
+//! ExternEVM custom EvmFactory — v4
 //!
-//! Designated fetcher rotation + commit-reveal binding.
-//! Exactly one validator fetches per request (chosen deterministically).
-//! Fetcher commits a hash of their answer before revealing.
-//! Non-fetchers wait for the verified reveal.
-//! In-block cache eliminates duplicate API hits within a single block.
-//! Single-node mode: commit-reveal skipped, behavior identical to v1.
+//! Designated fetcher rotation + commit-reveal binding (v3) +
+//! TLS certificate attestation (v4).
+//!
+//! The designated fetcher now signs an attestation binding the revealed value
+//! to a genuine TLS session with a certificate-validated domain:
+//!   digest = keccak256(requestHash ‖ domain ‖ certFingerprint ‖ responseHash ‖ timestamp)
+//! signed with the validator's secp256k1 key (EXTERNEVM_VALIDATOR_PRIVKEY).
+//!
+//! Single-node mode: commit-reveal AND attestation skipped, behavior identical to v1.
 
 use alloy_evm::{
     eth::EthEvmContext,
@@ -27,7 +30,7 @@ use std::time::{Duration, Instant};
 
 use crate::extern_proto::{
     commit_sender, reveal_sender, ExternCommitMsg, ExternRevealMsg,
-    compute_request_hash,
+    compute_request_hash, compute_attestation_digest,
 };
 use crate::protocol_store::{global_store, ValidatorCommit};
 
@@ -46,8 +49,8 @@ pub const API_CALL_ADDRESS: Address = {
 // ---------------------------------------------------------------------------
 
 const GAS_CACHE_HIT: u64 =    100; // in-block cache hit — just a hashmap lookup
-const GAS_VERIFY:    u64 =  1_000; // non-fetcher path — verify commit+reveal
-const GAS_FETCH:     u64 = 10_000; // fetcher path — HTTP + commit + reveal
+const GAS_VERIFY:    u64 =  1_500; // non-fetcher path — verify commit+reveal+attestation (v4: was 1_000)
+const GAS_FETCH:     u64 = 12_000; // fetcher path — HTTP + cert capture + commit + sign + reveal (v4: was 10_000)
 
 // Legacy constant kept for v2 compat path in single-node
 const API_CALL_GAS: u64 = 3_000;
@@ -131,13 +134,66 @@ fn node_validator_address() -> Address {
     *ADDR
 }
 
+/// v4: load this node's secp256k1 signing key from EXTERNEVM_VALIDATOR_PRIVKEY.
+/// Returns None if unset/invalid — the fetcher path then halts with a clear error.
+fn node_validator_signing_key() -> Option<secp256k1::SecretKey> {
+    use std::sync::LazyLock;
+    static KEY: LazyLock<Option<secp256k1::SecretKey>> = LazyLock::new(|| {
+        let raw = std::env::var("EXTERNEVM_VALIDATOR_PRIVKEY").ok()?;
+        let hex_str = raw.trim().strip_prefix("0x").unwrap_or(raw.trim());
+        if hex_str.len() != 64 {
+            eprintln!("[ExternEVM v4] EXTERNEVM_VALIDATOR_PRIVKEY must be 32-byte hex");
+            return None;
+        }
+        let mut bytes = [0u8; 32];
+        for i in 0..32 {
+            match u8::from_str_radix(&hex_str[i * 2..i * 2 + 2], 16) {
+                Ok(b) => bytes[i] = b,
+                Err(_) => {
+                    eprintln!("[ExternEVM v4] EXTERNEVM_VALIDATOR_PRIVKEY is not valid hex");
+                    return None;
+                }
+            }
+        }
+        match secp256k1::SecretKey::from_slice(&bytes) {
+            Ok(sk) => Some(sk),
+            Err(e) => {
+                eprintln!("[ExternEVM v4] invalid secp256k1 secret key: {e}");
+                None
+            }
+        }
+    });
+    (*KEY).clone()
+}
+
+/// v4: derive the Ethereum-style address from a secp256k1 secret key.
+fn address_from_secret_key(sk: &secp256k1::SecretKey) -> Address {
+    let secp = secp256k1::Secp256k1::new();
+    let pk = secp256k1::PublicKey::from_secret_key(&secp, sk);
+    let uncompressed = pk.serialize_uncompressed(); // 65 bytes, leading 0x04
+    let hash = keccak256(&uncompressed[1..]);       // hash the 64-byte body
+    Address::from_slice(&hash[12..])
+}
+
 fn ensure_validator_registered() {
     use std::sync::Once;
     static INIT: Once = Once::new();
     INIT.call_once(|| {
         let addr = node_validator_address();
         global_store().register_validator(addr);
-        eprintln!("[ExternEVM v3] Registered self as validator: {:?}", addr);
+        eprintln!("[ExternEVM v4] Registered self as validator: {:?}", addr);
+
+        // v4: sanity-check that the signing key (if present) matches the identity.
+        if let Some(sk) = node_validator_signing_key() {
+            let derived = address_from_secret_key(&sk);
+            if derived != addr {
+                eprintln!(
+                    "[ExternEVM v4] WARNING: EXTERNEVM_VALIDATOR_PRIVKEY derives {:?} but \
+                     EXTERNEVM_VALIDATOR_ADDRESS is {:?} — attestations will be rejected by peers",
+                    derived, addr
+                );
+            }
+        }
     });
 }
 
@@ -177,15 +233,39 @@ fn is_private_url(url: &str) -> bool {
             && host.split('.').nth(1).and_then(|s| s.parse::<u8>().ok()).is_some_and(|n| (16..=31).contains(&n)))
 }
 
+/// v4: extract the host (domain) from a URL. Both signer and verifier call this
+/// on the same request URL, so consistency — not canonicalization — is what matters.
+fn extract_host(url: &str) -> String {
+    let after_scheme = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url);
+    after_scheme
+        .split('/')
+        .next()
+        .unwrap_or(after_scheme)
+        .split(':')
+        .next()
+        .unwrap_or(after_scheme)
+        .to_string()
+}
+
 // ---------------------------------------------------------------------------
-// HTTP call (unchanged from v2)
+// HTTP call (v4: captures raw body bytes + server leaf certificate)
 // ---------------------------------------------------------------------------
 
-fn perform_http_call(request: &ApiRequest) -> Result<JsonValue, String> {
+struct HttpResult {
+    json: JsonValue,
+    body_bytes: Vec<u8>,
+    cert_der: Option<Vec<u8>>,
+}
+
+fn perform_http_call(request: &ApiRequest) -> Result<HttpResult, String> {
     tokio::task::block_in_place(|| {
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_millis(HTTP_TIMEOUT_MS))
             .redirect(reqwest::redirect::Policy::none())
+            .tls_info(true) // v4: surface the peer certificate on the response
             .build()
             .map_err(|e| format!("failed to build HTTP client: {e}"))?;
 
@@ -195,7 +275,7 @@ fn perform_http_call(request: &ApiRequest) -> Result<JsonValue, String> {
             other  => return Err(format!("unsupported method: {other}")),
         };
 
-        req_builder = req_builder.header("User-Agent", "ExternEVM/0.7.0");
+        req_builder = req_builder.header("User-Agent", "ExternEVM/0.8.0");
 
         if !request.headers.is_empty() {
             match serde_json::from_slice::<serde_json::Value>(&request.headers) {
@@ -221,13 +301,23 @@ fn perform_http_call(request: &ApiRequest) -> Result<JsonValue, String> {
             return Err(format!("HTTP {}", response.status()));
         }
 
+        // v4: capture the leaf cert DER BEFORE consuming the response with .bytes().
+        let cert_der = response
+            .extensions()
+            .get::<reqwest::tls::TlsInfo>()
+            .and_then(|info| info.peer_certificate())
+            .map(|der| der.to_vec());
+
         let body_bytes = response.bytes().map_err(|e| format!("failed to read response body: {e}"))?;
 
         if body_bytes.len() > MAX_RESPONSE_SIZE {
             return Err(format!("response size {} exceeds max {}", body_bytes.len(), MAX_RESPONSE_SIZE));
         }
 
-        serde_json::from_slice(&body_bytes).map_err(|e| format!("failed to parse response JSON: {e}"))
+        let json = serde_json::from_slice(&body_bytes)
+            .map_err(|e| format!("failed to parse response JSON: {e}"))?;
+
+        Ok(HttpResult { json, body_bytes: body_bytes.to_vec(), cert_der })
     })
 }
 
@@ -317,6 +407,24 @@ fn compute_commitment(value: &[u8], salt: &[u8; 32]) -> B256 {
 }
 
 // ---------------------------------------------------------------------------
+// Attestation signing (v4)
+// ---------------------------------------------------------------------------
+
+/// Sign a 32-byte attestation digest, producing a 65-byte recoverable signature:
+/// r(32) ‖ s(32) ‖ v(1), where v is the raw recovery id (0 or 1). The verifier
+/// recovers the signer address with the same convention.
+fn sign_attestation(digest: B256, sk: &secp256k1::SecretKey) -> Vec<u8> {
+    let secp = secp256k1::Secp256k1::signing_only();
+    let msg = secp256k1::Message::from_digest(digest.0);
+    let recoverable = secp.sign_ecdsa_recoverable(&msg, sk);
+    let (recovery_id, compact) = recoverable.serialize_compact();
+    let mut out = Vec::with_capacity(65);
+    out.extend_from_slice(&compact);        // r ‖ s
+    out.push(i32::from(recovery_id) as u8);   // v (0 or 1)
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Precompile entry point
 // ---------------------------------------------------------------------------
 
@@ -336,7 +444,7 @@ fn api_call_precompile(input: PrecompileInput<'_>) -> PrecompileResult {
     let request = match ApiRequest::abi_decode(input.data) {
         Ok(req) => req,
         Err(e) => {
-            eprintln!("[ExternEVM v3] ABI decode error: {e}");
+            eprintln!("[ExternEVM v4] ABI decode error: {e}");
             return Ok(PrecompileOutput::halt(
                 PrecompileHalt::Other("API_CALL: failed to decode ApiRequest".into()),
                 input.reservoir,
@@ -345,7 +453,7 @@ fn api_call_precompile(input: PrecompileInput<'_>) -> PrecompileResult {
     };
 
     eprintln!(
-        "[ExternEVM v3] API_CALL: url={} method={} path={} type={}",
+        "[ExternEVM v4] API_CALL: url={} method={} path={} type={}",
         request.url, request.method, request.responsePath, request.responseType
     );
 
@@ -383,29 +491,29 @@ fn api_call_precompile(input: PrecompileInput<'_>) -> PrecompileResult {
         if input.gas < GAS_CACHE_HIT {
             return Ok(PrecompileOutput::halt(PrecompileHalt::OutOfGas, input.reservoir));
         }
-        eprintln!("[ExternEVM v3] cache hit for request {:?}", request_hash);
+        eprintln!("[ExternEVM v4] cache hit for request {:?}", request_hash);
         return Ok(PrecompileOutput::new(GAS_CACHE_HIT, cached.into(), input.reservoir));
     }
 
     let validators = store.get_validators();
     let my_addr = node_validator_address();
 
-    // 2. Single-node fast path — skip commit-reveal overhead entirely
+    // 2. Single-node fast path — skip commit-reveal AND attestation entirely
     if validators.len() <= 1 {
         if input.gas < API_CALL_GAS {
             return Ok(PrecompileOutput::halt(PrecompileHalt::OutOfGas, input.reservoir));
         }
-        let json = match perform_http_call(&request) {
-            Ok(j) => j,
+        let http = match perform_http_call(&request) {
+            Ok(r) => r,
             Err(e) => {
-                eprintln!("[ExternEVM v3] HTTP error (single-node): {e}");
+                eprintln!("[ExternEVM v4] HTTP error (single-node): {e}");
                 return Ok(PrecompileOutput::halt(
                     PrecompileHalt::Other(format!("API_CALL: HTTP error: {e}").into()),
                     input.reservoir,
                 ));
             }
         };
-        let extracted = match extract_json_path(&json, &request.responsePath) {
+        let extracted = match extract_json_path(&http.json, &request.responsePath) {
             Some(v) => v.clone(),
             None => {
                 return Ok(PrecompileOutput::halt(
@@ -417,7 +525,7 @@ fn api_call_precompile(input: PrecompileInput<'_>) -> PrecompileResult {
         match encode_json_value(&extracted, request.responseType) {
             Ok(encoded) => {
                 store.populate_cache(request_hash, block_number, encoded.clone());
-                eprintln!("[ExternEVM v3] single-node: returning {} bytes", encoded.len());
+                eprintln!("[ExternEVM v4] single-node: returning {} bytes", encoded.len());
                 return Ok(PrecompileOutput::new(API_CALL_GAS, encoded.into(), input.reservoir));
             }
             Err(e) => {
@@ -441,30 +549,30 @@ fn api_call_precompile(input: PrecompileInput<'_>) -> PrecompileResult {
     };
 
     eprintln!(
-        "[ExternEVM v3] request {:?} → designated fetcher: {:?} (I am: {:?})",
+        "[ExternEVM v4] request {:?} → designated fetcher: {:?} (I am: {:?})",
         request_hash, designated, my_addr
     );
 
     if my_addr == designated {
         // ----------------------------------------------------------------
-        // FETCHER PATH: fetch → commit → wait → reveal → return
+        // FETCHER PATH: fetch → attest → commit → wait → reveal → return
         // ----------------------------------------------------------------
         if input.gas < GAS_FETCH {
             return Ok(PrecompileOutput::halt(PrecompileHalt::OutOfGas, input.reservoir));
         }
 
-        // Fetch
-        let json = match perform_http_call(&request) {
-            Ok(j) => j,
+        // Fetch (captures raw bytes + cert)
+        let http = match perform_http_call(&request) {
+            Ok(r) => r,
             Err(e) => {
-                eprintln!("[ExternEVM v3] HTTP error (fetcher): {e}");
+                eprintln!("[ExternEVM v4] HTTP error (fetcher): {e}");
                 return Ok(PrecompileOutput::halt(
                     PrecompileHalt::Other(format!("API_CALL: HTTP error: {e}").into()),
                     input.reservoir,
                 ));
             }
         };
-        let extracted = match extract_json_path(&json, &request.responsePath) {
+        let extracted = match extract_json_path(&http.json, &request.responsePath) {
             Some(v) => v.clone(),
             None => {
                 return Ok(PrecompileOutput::halt(
@@ -482,6 +590,36 @@ fn api_call_precompile(input: PrecompileInput<'_>) -> PrecompileResult {
                 ));
             }
         };
+
+        // v4: build the TLS attestation
+        let cert_der = match http.cert_der {
+            Some(c) if !c.is_empty() => c,
+            _ => {
+                return Ok(PrecompileOutput::halt(
+                    PrecompileHalt::Other(
+                        "API_CALL: v4 attestation requires HTTPS (no TLS certificate captured)".into(),
+                    ),
+                    input.reservoir,
+                ));
+            }
+        };
+        let sk = match node_validator_signing_key() {
+            Some(k) => k,
+            None => {
+                return Ok(PrecompileOutput::halt(
+                    PrecompileHalt::Other(
+                        "API_CALL: EXTERNEVM_VALIDATOR_PRIVKEY not set (required to sign v4 attestation)".into(),
+                    ),
+                    input.reservoir,
+                ));
+            }
+        };
+        let domain = extract_host(&request.url);
+        let response_hash = keccak256(&http.body_bytes);
+        let timestamp_secs = unix_secs();
+        let attestation_digest =
+            compute_attestation_digest(request_hash, &domain, &cert_der, response_hash, timestamp_secs);
+        let attestation_sig = sign_attestation(attestation_digest, &sk);
 
         // Generate salt and commitment
         let mut salt = [0u8; 32];
@@ -502,22 +640,26 @@ fn api_call_precompile(input: PrecompileInput<'_>) -> PrecompileResult {
             commitment,
             validator: my_addr,
         });
-        eprintln!("[ExternEVM v3] committed for request {:?}", request_hash);
+        eprintln!("[ExternEVM v4] committed for request {:?}", request_hash);
 
         // Wait for commit window so non-fetchers can receive our commit
         std::thread::sleep(Duration::from_millis(commit_window_ms()));
 
-        // Broadcast reveal
+        // Broadcast reveal (now carrying the TLS attestation)
         let _ = reveal_sender().send(ExternRevealMsg {
             request_hash,
             value: encoded.clone(),
             salt: B256::from(salt),
             validator: my_addr,
+            cert_der,
+            response_hash,
+            timestamp_secs,
+            attestation_sig,
         });
-        eprintln!("[ExternEVM v3] revealed for request {:?}", request_hash);
+        eprintln!("[ExternEVM v4] revealed (with attestation) for request {:?}", request_hash);
 
         store.populate_cache(request_hash, block_number, encoded.clone());
-        eprintln!("[ExternEVM v3] fetcher: returning {} bytes", encoded.len());
+        eprintln!("[ExternEVM v4] fetcher: returning {} bytes", encoded.len());
         Ok(PrecompileOutput::new(GAS_FETCH, encoded.into(), input.reservoir))
 
     } else {
@@ -534,7 +676,7 @@ fn api_call_precompile(input: PrecompileInput<'_>) -> PrecompileResult {
         loop {
             if let Some(value) = store.get_verified_reveal(request_hash, designated) {
                 eprintln!(
-                    "[ExternEVM v3] non-fetcher: verified reveal from {:?}, returning {} bytes",
+                    "[ExternEVM v4] non-fetcher: verified reveal from {:?}, returning {} bytes",
                     designated,
                     value.len()
                 );
@@ -544,7 +686,7 @@ fn api_call_precompile(input: PrecompileInput<'_>) -> PrecompileResult {
 
             if Instant::now() > deadline {
                 eprintln!(
-                    "[ExternEVM v3] timeout waiting for reveal from designated fetcher {:?}",
+                    "[ExternEVM v4] timeout waiting for reveal from designated fetcher {:?}",
                     designated
                 );
                 return Ok(PrecompileOutput::halt(
@@ -561,7 +703,7 @@ fn api_call_precompile(input: PrecompileInput<'_>) -> PrecompileResult {
 }
 
 // ---------------------------------------------------------------------------
-// Unix ms helper
+// Unix time helpers
 // ---------------------------------------------------------------------------
 
 fn unix_ms() -> u64 {
@@ -569,6 +711,13 @@ fn unix_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+fn unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 // ---------------------------------------------------------------------------
