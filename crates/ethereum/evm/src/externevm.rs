@@ -32,7 +32,7 @@ use crate::extern_proto::{
     commit_sender, reveal_sender, ExternCommitMsg, ExternRevealMsg,
     compute_request_hash, compute_attestation_digest,
 };
-use crate::protocol_store::{global_store, ValidatorCommit};
+use crate::protocol_store::{global_store, ValidatorCommit, RevealOutcome};
 
 // ---------------------------------------------------------------------------
 // Precompile address
@@ -664,40 +664,53 @@ fn api_call_precompile(input: PrecompileInput<'_>) -> PrecompileResult {
 
     } else {
         // ----------------------------------------------------------------
-        // NON-FETCHER PATH: wait for verified reveal from designated fetcher
+        // NON-FETCHER PATH: wait for the attested reveal from the fetcher
         // ----------------------------------------------------------------
         if input.gas < GAS_VERIFY {
             return Ok(PrecompileOutput::halt(PrecompileHalt::OutOfGas, input.reservoir));
         }
 
+        let domain = extract_host(&request.url);
         let deadline =
             Instant::now() + Duration::from_millis(commit_window_ms() + reveal_window_ms());
 
         loop {
-            if let Some(value) = store.get_verified_reveal(request_hash, designated) {
-                eprintln!(
-                    "[ExternEVM v4] non-fetcher: verified reveal from {:?}, returning {} bytes",
-                    designated,
-                    value.len()
-                );
-                store.populate_cache(request_hash, block_number, value.clone());
-                return Ok(PrecompileOutput::new(GAS_VERIFY, value.into(), input.reservoir));
+            match store.check_reveal(request_hash, designated, &domain, unix_secs()) {
+                RevealOutcome::Verified(value) => {
+                    eprintln!(
+                        "[ExternEVM v4] non-fetcher: attested reveal from {:?}, returning {} bytes",
+                        designated,
+                        value.len()
+                    );
+                    store.populate_cache(request_hash, block_number, value.clone());
+                    return Ok(PrecompileOutput::new(GAS_VERIFY, value.into(), input.reservoir));
+                }
+                RevealOutcome::Rejected(reason) => {
+                    eprintln!(
+                        "[ExternEVM v4] reveal from designated fetcher {:?} REJECTED: {reason}",
+                        designated
+                    );
+                    return Ok(PrecompileOutput::halt(
+                        PrecompileHalt::Other(format!("API_CALL: reveal rejected: {reason}").into()),
+                        input.reservoir,
+                    ));
+                }
+                RevealOutcome::Pending => {
+                    if Instant::now() > deadline {
+                        eprintln!(
+                            "[ExternEVM v4] timeout waiting for reveal from designated fetcher {:?}",
+                            designated
+                        );
+                        return Ok(PrecompileOutput::halt(
+                            PrecompileHalt::Other(
+                                "API_CALL: timeout — designated fetcher did not reveal".into(),
+                            ),
+                            input.reservoir,
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
             }
-
-            if Instant::now() > deadline {
-                eprintln!(
-                    "[ExternEVM v4] timeout waiting for reveal from designated fetcher {:?}",
-                    designated
-                );
-                return Ok(PrecompileOutput::halt(
-                    PrecompileHalt::Other(
-                        "API_CALL: timeout — designated fetcher did not reveal".into(),
-                    ),
-                    input.reservoir,
-                ));
-            }
-
-            std::thread::sleep(Duration::from_millis(10));
         }
     }
 }

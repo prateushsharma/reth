@@ -1,7 +1,12 @@
-//! ExternEVM Protocol Store — v3
+//! ExternEVM Protocol Store — v4
 //!
-//! Adds designated fetcher rotation, commit-reveal binding, and in-block
-//! response caching on top of the v2 submission infrastructure.
+//! v3: designated fetcher rotation, commit-reveal binding, in-block cache.
+//! v4: TLS certificate attestation verification. The reveal record now carries
+//! the fetcher's attestation (cert DER, response hash, timestamp, signature).
+//! `check_reveal` verifies, at the precompile read path (where the request URL
+//! and thus the domain is available): commit-reveal binding, that the
+//! attestation signer is the claimed validator, that the leaf certificate
+//! covers the requested domain and is currently valid, and freshness.
 
 use alloy_primitives::{keccak256, Address, B256, U256};
 use std::collections::HashMap;
@@ -9,6 +14,8 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc, RwLock,
 };
+
+use crate::extern_proto::compute_attestation_digest;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -19,6 +26,10 @@ pub const SUBMISSION_THRESHOLD_PERCENT: u64 = 51;
 pub const API_REQUEST_GAS: u64 = 10_000;
 pub const API_READ_GAS: u64 = 3_000;
 
+// v4: attestation freshness bounds (seconds)
+const ATTESTATION_MAX_AGE_SECS: u64 = 300; // reveal must be at most 5 min old
+const ATTESTATION_MAX_SKEW_SECS: u64 = 60; // tolerate 1 min of clock skew ahead
+
 // ---------------------------------------------------------------------------
 // Request status
 // ---------------------------------------------------------------------------
@@ -28,6 +39,20 @@ pub enum RequestStatus {
     Pending,
     Finalized,
     TimedOut,
+}
+
+// ---------------------------------------------------------------------------
+// v4: reveal verification outcome (three-way so the precompile can fail fast)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub enum RevealOutcome {
+    /// No (or not-yet-arrived) reveal from the designated fetcher — keep waiting.
+    Pending,
+    /// Commit-reveal binding AND attestation both verified — value is good.
+    Verified(Vec<u8>),
+    /// A reveal arrived but failed verification — definitive, stop waiting.
+    Rejected(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -65,14 +90,19 @@ pub struct ValidatorCommit {
     pub received_at_ms: u64,
 }
 
-/// v3: phase 2 — reveal from designated fetcher
+/// v3 reveal + v4 attestation — from designated fetcher
 #[derive(Debug, Clone)]
 pub struct ValidatorReveal {
     pub request_hash: B256,
     pub validator: Address,
     pub value: Vec<u8>,
     pub salt: [u8; 32],
-    pub verified: bool,
+    pub verified: bool, // commit-reveal binding verified (v3-level)
+    // v4 attestation fields:
+    pub cert_der: Vec<u8>,
+    pub response_hash: B256,
+    pub timestamp_secs: u64,
+    pub attestation_sig: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
@@ -155,14 +185,11 @@ impl ProtocolStore {
     // Designated fetcher (v3)
     // -----------------------------------------------------------------------
 
-    /// Deterministically select the fetcher for a given request_hash.
-    /// All nodes with the same validator list will arrive at the same result.
     pub fn designate_fetcher(&self, request_hash: B256) -> Option<Address> {
         let store = self.inner.read().unwrap();
         if store.validators.is_empty() {
             return None;
         }
-        // Take first 8 bytes of hash as u64, mod validator count
         let hash_u64 = u64::from_be_bytes(request_hash.0[0..8].try_into().unwrap());
         let idx = (hash_u64 % store.validators.len() as u64) as usize;
         Some(store.validators[idx])
@@ -216,25 +243,26 @@ impl ProtocolStore {
     }
 
     // -----------------------------------------------------------------------
-    // Reveal + verification (v3)
+    // Reveal + verification (v3 commit-reveal + v4 attestation storage)
     // -----------------------------------------------------------------------
 
-    /// Store a reveal and verify it matches the previously stored commitment.
-    /// Returns true if verified, false if mismatch or no commit found.
+    #[allow(clippy::too_many_arguments)]
     pub fn store_reveal(
         &self,
         request_hash: B256,
         validator: Address,
         value: Vec<u8>,
         salt: [u8; 32],
+        cert_der: Vec<u8>,
+        response_hash: B256,
+        timestamp_secs: u64,
+        attestation_sig: Vec<u8>,
     ) -> bool {
-        // Compute commitment from revealed value + salt
         let mut preimage = Vec::with_capacity(value.len() + 32);
         preimage.extend_from_slice(&value);
         preimage.extend_from_slice(&salt);
         let actual_commitment = keccak256(&preimage);
 
-        // Look up stored commitment
         let stored_commitment = {
             let store = self.inner.read().unwrap();
             store
@@ -256,7 +284,7 @@ impl ProtocolStore {
 
         if !verified {
             eprintln!(
-                "[ExternEVM] commitment mismatch from {:?} for request {:?} — v4: slashable event",
+                "[ExternEVM] commitment mismatch from {:?} for request {:?} — v4-zktls would close body authenticity",
                 validator, request_hash
             );
         }
@@ -269,6 +297,10 @@ impl ProtocolStore {
                 value,
                 salt,
                 verified,
+                cert_der,
+                response_hash,
+                timestamp_secs,
+                attestation_sig,
             },
         );
 
@@ -283,6 +315,53 @@ impl ProtocolStore {
             .get(&(request_hash, validator))
             .filter(|r| r.verified)
             .map(|r| r.value.clone())
+    }
+
+    pub fn check_reveal(
+        &self,
+        request_hash: B256,
+        validator: Address,
+        domain: &str,
+        now_secs: u64,
+    ) -> RevealOutcome {
+        let reveal = {
+            let store = self.inner.read().unwrap();
+            match store.reveals.get(&(request_hash, validator)) {
+                Some(r) => r.clone(),
+                None => return RevealOutcome::Pending,
+            }
+        };
+
+        if !reveal.verified {
+            return RevealOutcome::Rejected("commitment mismatch".to_string());
+        }
+
+        let digest = compute_attestation_digest(
+            request_hash,
+            domain,
+            &reveal.cert_der,
+            reveal.response_hash,
+            reveal.timestamp_secs,
+        );
+        let signer = match recover_attestation_signer(digest, &reveal.attestation_sig) {
+            Some(a) => a,
+            None => return RevealOutcome::Rejected("attestation signature recovery failed".to_string()),
+        };
+        if signer != validator {
+            return RevealOutcome::Rejected(format!(
+                "attestation signer {signer:?} != designated fetcher {validator:?}"
+            ));
+        }
+
+        if let Err(e) = validate_cert_for_domain(&reveal.cert_der, domain) {
+            return RevealOutcome::Rejected(format!("cert validation failed: {e}"));
+        }
+
+        if !attestation_fresh(reveal.timestamp_secs, now_secs) {
+            return RevealOutcome::Rejected("attestation timestamp outside freshness window".to_string());
+        }
+
+        RevealOutcome::Verified(reveal.value)
     }
 
     // -----------------------------------------------------------------------
@@ -470,6 +549,87 @@ impl ProtocolStore {
 }
 
 // ---------------------------------------------------------------------------
+// v4 attestation verification helpers
+// ---------------------------------------------------------------------------
+
+fn recover_attestation_signer(digest: B256, sig: &[u8]) -> Option<Address> {
+    use secp256k1::ecdsa::{RecoverableSignature, RecoveryId};
+    if sig.len() != 65 {
+        return None;
+    }
+    let recid = RecoveryId::try_from(sig[64] as i32).ok()?;
+    let rec_sig = RecoverableSignature::from_compact(&sig[..64], recid).ok()?;
+    let secp = secp256k1::Secp256k1::new();
+    let msg = secp256k1::Message::from_digest(digest.0);
+    let pubkey = secp.recover_ecdsa(&msg, &rec_sig).ok()?;
+    let uncompressed = pubkey.serialize_uncompressed();
+    let hash = keccak256(&uncompressed[1..]);
+    Some(Address::from_slice(&hash[12..]))
+}
+
+fn dns_name_matches(cert_name: &str, domain: &str) -> bool {
+    let cert_name = cert_name.trim().to_ascii_lowercase();
+    let domain = domain.trim().to_ascii_lowercase();
+    if cert_name == domain {
+        return true;
+    }
+    if let Some(suffix) = cert_name.strip_prefix("*.") {
+        if let Some(pos) = domain.find('.') {
+            return &domain[pos + 1..] == suffix;
+        }
+    }
+    false
+}
+
+fn validate_cert_for_domain(cert_der: &[u8], domain: &str) -> Result<(), String> {
+    use x509_parser::prelude::*;
+    if cert_der.is_empty() {
+        return Err("empty certificate".to_string());
+    }
+    let (_, cert) = X509Certificate::from_der(cert_der)
+        .map_err(|_| "certificate failed to parse as X.509 DER".to_string())?;
+
+    if !cert.validity().is_valid() {
+        return Err("certificate outside its validity period".to_string());
+    }
+
+    let mut matched = false;
+    if let Ok(Some(san)) = cert.subject_alternative_name() {
+        for gn in &san.value.general_names {
+            if let GeneralName::DNSName(name) = gn {
+                if dns_name_matches(name, domain) {
+                    matched = true;
+                    break;
+                }
+            }
+        }
+    }
+    if !matched {
+        for cn in cert.subject().iter_common_name() {
+            if let Ok(name) = cn.as_str() {
+                if dns_name_matches(name, domain) {
+                    matched = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    if matched {
+        Ok(())
+    } else {
+        Err(format!("certificate does not cover domain '{domain}'"))
+    }
+}
+
+fn attestation_fresh(timestamp_secs: u64, now_secs: u64) -> bool {
+    if timestamp_secs > now_secs + ATTESTATION_MAX_SKEW_SECS {
+        return false;
+    }
+    now_secs.saturating_sub(timestamp_secs) <= ATTESTATION_MAX_AGE_SECS
+}
+
+// ---------------------------------------------------------------------------
 // Aggregation helpers (v2 compat — kept)
 // ---------------------------------------------------------------------------
 
@@ -544,8 +704,6 @@ mod tests {
         store.register_validator(address!("3C44CdDdB6a900fa2b585dd299e03d12FA4293BC"));
         store
     }
-
-    // ---- v2 tests (all kept) ----
 
     #[test]
     fn test_create_request_and_read() {
@@ -633,8 +791,6 @@ mod tests {
         assert_eq!(compute_majority_bool(&[true, true, false]), Some(true));
     }
 
-    // ---- v3 new tests ----
-
     #[test]
     fn test_designate_fetcher_deterministic() {
         let store = test_store();
@@ -654,7 +810,6 @@ mod tests {
     #[test]
     fn test_designate_fetcher_distribution() {
         let store = test_store();
-        // 3 validators, check all 3 get designated for some hash
         let mut seen = std::collections::HashSet::new();
         for i in 0u8..=255 {
             let mut h = [0u8; 32];
@@ -693,19 +848,16 @@ mod tests {
         let value = vec![0u8; 31].into_iter().chain([42u8]).collect::<Vec<_>>();
         let salt = [0xCCu8; 32];
 
-        // Compute commitment
         let mut preimage = value.clone();
         preimage.extend_from_slice(&salt);
         let commitment = keccak256(&preimage);
 
-        store.store_commit(ValidatorCommit {
-            request_hash,
-            validator,
-            commitment,
-            received_at_ms: 0,
-        });
+        store.store_commit(ValidatorCommit { request_hash, validator, commitment, received_at_ms: 0 });
 
-        let verified = store.store_reveal(request_hash, validator, value.clone(), salt);
+        let verified = store.store_reveal(
+            request_hash, validator, value.clone(), salt,
+            vec![], B256::ZERO, 0, vec![],
+        );
         assert!(verified);
         assert_eq!(store.get_verified_reveal(request_hash, validator), Some(value));
     }
@@ -723,14 +875,12 @@ mod tests {
         preimage.extend_from_slice(&salt);
         let commitment = keccak256(&preimage);
 
-        store.store_commit(ValidatorCommit {
-            request_hash,
-            validator,
-            commitment,
-            received_at_ms: 0,
-        });
+        store.store_commit(ValidatorCommit { request_hash, validator, commitment, received_at_ms: 0 });
 
-        let verified = store.store_reveal(request_hash, validator, value, wrong_salt);
+        let verified = store.store_reveal(
+            request_hash, validator, value, wrong_salt,
+            vec![], B256::ZERO, 0, vec![],
+        );
         assert!(!verified);
         assert!(store.get_verified_reveal(request_hash, validator).is_none());
     }
@@ -740,7 +890,10 @@ mod tests {
         let store = ProtocolStore::new();
         let request_hash = B256::from([0xDDu8; 32]);
         let validator = address!("3C44CdDdB6a900fa2b585dd299e03d12FA4293BC");
-        let verified = store.store_reveal(request_hash, validator, vec![1, 2, 3], [0u8; 32]);
+        let verified = store.store_reveal(
+            request_hash, validator, vec![1, 2, 3], [0u8; 32],
+            vec![], B256::ZERO, 0, vec![],
+        );
         assert!(!verified);
     }
 
@@ -751,9 +904,78 @@ mod tests {
         store.create_request(rid, 100, "https://api.example.com".into(), "GET".into(), vec![], vec![], "value".into(), 1);
         store.finalize_request(rid, vec![1, 2, 3], 1, 103).unwrap();
         store.cleanup(140, 50);
-        assert!(store.get_request(&rid).is_some()); // not old enough
+        assert!(store.get_request(&rid).is_some());
         store.cleanup(200, 50);
         assert!(store.get_request(&rid).is_none());
         assert!(store.get_finalized_result(&rid).is_none());
+    }
+
+    #[test]
+    fn test_recover_attestation_signer() {
+        use secp256k1::{Secp256k1, SecretKey, Message};
+        let secp = Secp256k1::new();
+        let sk = SecretKey::from_slice(&[0x11u8; 32]).unwrap();
+        let pk = secp256k1::PublicKey::from_secret_key(&secp, &sk);
+        let unc = pk.serialize_uncompressed();
+        let addr = Address::from_slice(&keccak256(&unc[1..])[12..]);
+
+        let digest = B256::from([0x42u8; 32]);
+        let msg = Message::from_digest(digest.0);
+        let recoverable = secp.sign_ecdsa_recoverable(&msg, &sk);
+        let (recid, compact) = recoverable.serialize_compact();
+        let mut sig = compact.to_vec();
+        sig.push(i32::from(recid) as u8);
+
+        assert_eq!(recover_attestation_signer(digest, &sig), Some(addr));
+        assert_ne!(recover_attestation_signer(B256::from([0x43u8; 32]), &sig), Some(addr));
+        assert_eq!(recover_attestation_signer(digest, &[0u8; 10]), None);
+    }
+
+    #[test]
+    fn test_dns_name_matches() {
+        assert!(dns_name_matches("api.coingecko.com", "api.coingecko.com"));
+        assert!(dns_name_matches("API.CoinGecko.com", "api.coingecko.com"));
+        assert!(dns_name_matches("*.coingecko.com", "api.coingecko.com"));
+        assert!(!dns_name_matches("*.coingecko.com", "coingecko.com"));
+        assert!(!dns_name_matches("*.coingecko.com", "a.b.coingecko.com"));
+        assert!(!dns_name_matches("api.coingecko.com", "api.evil.com"));
+    }
+
+    #[test]
+    fn test_attestation_fresh() {
+        assert!(attestation_fresh(1000, 1000));
+        assert!(attestation_fresh(1000, 1200));
+        assert!(!attestation_fresh(1000, 1400));
+        assert!(attestation_fresh(1000, 990));
+        assert!(!attestation_fresh(1000, 900));
+    }
+
+    #[test]
+    fn test_validate_cert_garbage_rejected() {
+        assert!(validate_cert_for_domain(&[], "api.coingecko.com").is_err());
+        assert!(validate_cert_for_domain(&[0x00, 0x01, 0x02, 0x03], "api.coingecko.com").is_err());
+    }
+
+    #[test]
+    fn test_check_reveal_pending_when_absent() {
+        let store = ProtocolStore::new();
+        let rh = B256::from([0x66u8; 32]);
+        let v = address!("f39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
+        assert!(matches!(store.check_reveal(rh, v, "api.x.com", 1000), RevealOutcome::Pending));
+    }
+
+    #[test]
+    fn test_check_reveal_rejects_commit_mismatch() {
+        let store = ProtocolStore::new();
+        let rh = B256::from([0x55u8; 32]);
+        let v = address!("f39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
+        let value = vec![1, 2, 3, 4];
+        let salt = [0xAAu8; 32];
+        let mut preimage = value.clone();
+        preimage.extend_from_slice(&salt);
+        let commitment = keccak256(&preimage);
+        store.store_commit(ValidatorCommit { request_hash: rh, validator: v, commitment, received_at_ms: 0 });
+        store.store_reveal(rh, v, value, [0xBBu8; 32], vec![], B256::ZERO, 0, vec![]);
+        assert!(matches!(store.check_reveal(rh, v, "api.x.com", 1000), RevealOutcome::Rejected(_)));
     }
 }

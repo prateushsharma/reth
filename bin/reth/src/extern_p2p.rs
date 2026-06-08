@@ -1,4 +1,14 @@
 //! ExternEVM extern/1 subprotocol — ProtocolHandler + ConnectionHandler.
+//!
+//! v4: transports three message types over extern/1 —
+//!   0x00 ExternDataMsg   (v2 compat — open value)
+//!   0x01 ExternCommitMsg (v3 — commitment)
+//!   0x02 ExternRevealMsg (v3 reveal + v4 TLS attestation)
+//! Each has its own broadcast channel; the connection drains all three
+//! outbound and dispatches all three inbound. Reveal receipt feeds the v4
+//! attestation fields into the protocol store; the attestation itself is
+//! verified later at the precompile read path (check_reveal), where the
+//! request domain is available.
 
 use alloy_primitives::bytes::BytesMut;
 use alloy_primitives::Address;
@@ -10,8 +20,11 @@ use reth_eth_wire::{
     protocol::Protocol,
     Capability,
 };
-use reth_evm_ethereum::extern_proto::{broadcast_subscribe, ExternDataMsg};
-use reth_evm_ethereum::protocol_store::global_store;
+use reth_evm_ethereum::extern_proto::{
+    broadcast_subscribe, commit_subscribe, reveal_subscribe, ExternCommitMsg, ExternDataMsg,
+    ExternRevealMsg, MSG_TYPE_COMMIT, MSG_TYPE_DATA, MSG_TYPE_REVEAL,
+};
+use reth_evm_ethereum::protocol_store::{global_store, ValidatorCommit};
 use reth_network::{
     protocol::{ConnectionHandler, OnNotSupported, ProtocolHandler},
     Direction,
@@ -32,7 +45,14 @@ use tokio::sync::broadcast;
 
 const EXTERN_PROTO_NAME: &str = "extern";
 const EXTERN_PROTO_VERSION: usize = 1;
-const EXTERN_PROTO_MSG_COUNT: u8 = 1;
+const EXTERN_PROTO_MSG_COUNT: u8 = 3; // v4: data + commit + reveal
+
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
 
 // ---------------------------------------------------------------------------
 // ProtocolHandler — factory, one per node
@@ -125,7 +145,9 @@ impl ConnectionHandler for ExternEvmConnHandler {
 
 pub struct ExternEvmConnection {
     conn: ProtocolConnection,
-    broadcast_rx: broadcast::Receiver<ExternDataMsg>,
+    data_rx: broadcast::Receiver<ExternDataMsg>,
+    commit_rx: broadcast::Receiver<ExternCommitMsg>,
+    reveal_rx: broadcast::Receiver<ExternRevealMsg>,
     local_validator: Address,
     peer_id: PeerId,
     pending_out: VecDeque<BytesMut>,
@@ -135,7 +157,9 @@ impl ExternEvmConnection {
     fn new(conn: ProtocolConnection, local_validator: Address, peer_id: PeerId) -> Self {
         Self {
             conn,
-            broadcast_rx: broadcast_subscribe(),
+            data_rx: broadcast_subscribe(),
+            commit_rx: commit_subscribe(),
+            reveal_rx: reveal_subscribe(),
             local_validator,
             peer_id,
             pending_out: VecDeque::new(),
@@ -149,49 +173,99 @@ impl ExternEvmConnection {
 
         let msg_id = data[0];
         let payload = &data[1..];
+        let store = global_store();
 
-        if msg_id != 0x00 {
-            eprintln!(
-                "[ExternEVM p2p] Unknown message ID {} from peer {:?}",
-                msg_id, self.peer_id
-            );
-            return;
-        }
-
-        let mut slice = payload;
-        match ExternDataMsg::decode(&mut slice) {
-            Ok(msg) => {
-                eprintln!(
-                    "[ExternEVM p2p] Received value from validator {:?} for request {:?} (type={})",
-                    msg.validator, msg.request_hash, msg.response_type
-                );
-
-                let store = global_store();
-
-                if !store.is_validator(&msg.validator) {
-                    store.register_validator(msg.validator);
-                    eprintln!(
-                        "[ExternEVM p2p] Auto-registered remote validator {:?}",
-                        msg.validator
-                    );
-                }
-
-                match store.submit_value(msg.request_hash, msg.validator, msg.value.clone(), 0) {
-                    Ok(()) => {
+        match msg_id {
+            MSG_TYPE_DATA => {
+                let mut slice = payload;
+                match ExternDataMsg::decode(&mut slice) {
+                    Ok(msg) => {
                         eprintln!(
-                            "[ExternEVM p2p] Stored peer value for request {:?}",
-                            msg.request_hash
+                            "[ExternEVM p2p] DATA from {:?} for request {:?} (type={})",
+                            msg.validator, msg.request_hash, msg.response_type
                         );
+                        if !store.is_validator(&msg.validator) {
+                            store.register_validator(msg.validator);
+                        }
+                        match store.submit_value(msg.request_hash, msg.validator, msg.value.clone(), 0) {
+                            Ok(()) => {}
+                            Err(e) => eprintln!("[ExternEVM p2p] DATA store failed: {}", e),
+                        }
                     }
-                    Err(e) => {
-                        eprintln!("[ExternEVM p2p] Failed to store peer value: {}", e);
-                    }
+                    Err(e) => eprintln!(
+                        "[ExternEVM p2p] decode ExternDataMsg from {:?} failed: {}",
+                        self.peer_id, e
+                    ),
                 }
             }
-            Err(e) => {
+            MSG_TYPE_COMMIT => {
+                let mut slice = payload;
+                match ExternCommitMsg::decode(&mut slice) {
+                    Ok(msg) => {
+                        eprintln!(
+                            "[ExternEVM p2p] COMMIT from {:?} for request {:?}",
+                            msg.validator, msg.request_hash
+                        );
+                        if !store.is_validator(&msg.validator) {
+                            store.register_validator(msg.validator);
+                        }
+                        store.store_commit(ValidatorCommit {
+                            request_hash: msg.request_hash,
+                            validator: msg.validator,
+                            commitment: msg.commitment,
+                            received_at_ms: unix_ms(),
+                        });
+                    }
+                    Err(e) => eprintln!(
+                        "[ExternEVM p2p] decode ExternCommitMsg from {:?} failed: {}",
+                        self.peer_id, e
+                    ),
+                }
+            }
+            MSG_TYPE_REVEAL => {
+                let mut slice = payload;
+                match ExternRevealMsg::decode(&mut slice) {
+                    Ok(msg) => {
+                        eprintln!(
+                            "[ExternEVM p2p] REVEAL from {:?} for request {:?} ({} cert bytes)",
+                            msg.validator,
+                            msg.request_hash,
+                            msg.cert_der.len()
+                        );
+                        if !store.is_validator(&msg.validator) {
+                            store.register_validator(msg.validator);
+                        }
+                        // Stores the reveal + v4 attestation fields and runs the
+                        // commit-reveal binding check. Attestation is verified
+                        // later at the read path (check_reveal), where the domain
+                        // is known.
+                        let commit_ok = store.store_reveal(
+                            msg.request_hash,
+                            msg.validator,
+                            msg.value.clone(),
+                            msg.salt.0,
+                            msg.cert_der.clone(),
+                            msg.response_hash,
+                            msg.timestamp_secs,
+                            msg.attestation_sig.clone(),
+                        );
+                        if !commit_ok {
+                            eprintln!(
+                                "[ExternEVM p2p] REVEAL from {:?} failed commit-reveal binding",
+                                msg.validator
+                            );
+                        }
+                    }
+                    Err(e) => eprintln!(
+                        "[ExternEVM p2p] decode ExternRevealMsg from {:?} failed: {}",
+                        self.peer_id, e
+                    ),
+                }
+            }
+            other => {
                 eprintln!(
-                    "[ExternEVM p2p] Failed to decode ExternDataMsg from peer {:?}: {}",
-                    self.peer_id, e
+                    "[ExternEVM p2p] Unknown message ID {} from peer {:?}",
+                    other, self.peer_id
                 );
             }
         }
@@ -226,26 +300,62 @@ impl Stream for ExternEvmConnection {
             }
         }
 
-        // 3. Check for broadcasts from our local precompile
+        // 3. Drain DATA broadcasts
         loop {
-            match this.broadcast_rx.try_recv() {
+            match this.data_rx.try_recv() {
                 Ok(msg) => {
-                    // Encode: message ID byte + RLP payload
                     let mut buf = BytesMut::new();
-                    buf.extend_from_slice(&[0x00]);
+                    buf.extend_from_slice(&[MSG_TYPE_DATA]);
                     msg.encode(&mut buf);
                     this.pending_out.push_back(buf);
                 }
                 Err(broadcast::error::TryRecvError::Empty) => break,
                 Err(broadcast::error::TryRecvError::Closed) => {
-                    eprintln!("[ExternEVM p2p] Broadcast channel closed");
+                    eprintln!("[ExternEVM p2p] DATA broadcast channel closed");
                     return Poll::Ready(None);
                 }
                 Err(broadcast::error::TryRecvError::Lagged(n)) => {
-                    eprintln!(
-                        "[ExternEVM p2p] Broadcast lagged by {} messages",
-                        n
-                    );
+                    eprintln!("[ExternEVM p2p] DATA broadcast lagged by {} messages", n);
+                }
+            }
+        }
+
+        // 4. Drain COMMIT broadcasts
+        loop {
+            match this.commit_rx.try_recv() {
+                Ok(msg) => {
+                    let mut buf = BytesMut::new();
+                    buf.extend_from_slice(&[MSG_TYPE_COMMIT]);
+                    msg.encode(&mut buf);
+                    this.pending_out.push_back(buf);
+                }
+                Err(broadcast::error::TryRecvError::Empty) => break,
+                Err(broadcast::error::TryRecvError::Closed) => {
+                    eprintln!("[ExternEVM p2p] COMMIT broadcast channel closed");
+                    return Poll::Ready(None);
+                }
+                Err(broadcast::error::TryRecvError::Lagged(n)) => {
+                    eprintln!("[ExternEVM p2p] COMMIT broadcast lagged by {} messages", n);
+                }
+            }
+        }
+
+        // 5. Drain REVEAL broadcasts
+        loop {
+            match this.reveal_rx.try_recv() {
+                Ok(msg) => {
+                    let mut buf = BytesMut::new();
+                    buf.extend_from_slice(&[MSG_TYPE_REVEAL]);
+                    msg.encode(&mut buf);
+                    this.pending_out.push_back(buf);
+                }
+                Err(broadcast::error::TryRecvError::Empty) => break,
+                Err(broadcast::error::TryRecvError::Closed) => {
+                    eprintln!("[ExternEVM p2p] REVEAL broadcast channel closed");
+                    return Poll::Ready(None);
+                }
+                Err(broadcast::error::TryRecvError::Lagged(n)) => {
+                    eprintln!("[ExternEVM p2p] REVEAL broadcast lagged by {} messages", n);
                 }
             }
         }
