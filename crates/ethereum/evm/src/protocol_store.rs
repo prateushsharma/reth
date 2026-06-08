@@ -190,9 +190,14 @@ impl ProtocolStore {
         if store.validators.is_empty() {
             return None;
         }
+        // Canonical order: sort by address so every node agrees on the fetcher
+        // regardless of the order validators were registered (registration is
+        // first-seen, which differs per node).
+        let mut sorted = store.validators.clone();
+        sorted.sort();
         let hash_u64 = u64::from_be_bytes(request_hash.0[0..8].try_into().unwrap());
-        let idx = (hash_u64 % store.validators.len() as u64) as usize;
-        Some(store.validators[idx])
+        let idx = (hash_u64 % sorted.len() as u64) as usize;
+        Some(sorted[idx])
     }
 
     // -----------------------------------------------------------------------
@@ -820,6 +825,33 @@ mod tests {
             }
         }
         assert_eq!(seen.len(), 3);
+    }
+
+    #[test]
+    fn test_designate_fetcher_order_independent() {
+        let v1 = address!("f39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
+        let v2 = address!("70997970C51812dc3A010C7d01b50e0d17dc79C8");
+        let v3 = address!("3C44CdDdB6a900fa2b585dd299e03d12FA4293BC");
+
+        // Same validators, different registration order on two nodes.
+        let a = ProtocolStore::new();
+        a.register_validator(v1);
+        a.register_validator(v2);
+        a.register_validator(v3);
+
+        let b = ProtocolStore::new();
+        b.register_validator(v3);
+        b.register_validator(v1);
+        b.register_validator(v2);
+
+        // They must designate the same fetcher for every request hash.
+        for i in 0u8..=255 {
+            let mut h = [0u8; 32];
+            h[0] = i;
+            h[7] = i;
+            let hash = B256::from(h);
+            assert_eq!(a.designate_fetcher(hash), b.designate_fetcher(hash));
+        }
     }
 
     #[test]
